@@ -3,14 +3,37 @@ name = "llm-testing"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.12.5"
 dependencies = [
+    "chromadb>=1.5.5",
     "ipykernel>=7.2.0",
     "langchain-community>=0.4.1",
-    "mlx-lm <=0.30.0",
+    "lenskit>=2026.1.0",
+    "mesa>=3.3.1",
+    "mlflow>=2.23.0",
+    "mlx-lm<=0.30.0",
+    "pandas>=2.3.0",
     "python-dotenv>=1.2.2",
+    "scikit-learn>=1.8.0",
+    "sentence-transformers>=5.3.0",
+    "tmdbsimple>=2.9.1",
     "torch>=2.10.0",
     "torchvision>=0.25.0",
+    "tqdm>=4.67.3",
     "transformers>=5.3.0",
     "ty>=0.0.27",
 ]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+    "pytest-xdist>=3.8.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["sim*"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
