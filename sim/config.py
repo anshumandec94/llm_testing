@@ -21,13 +21,13 @@ class SimConfig:
     experiment_name: str = "abm-recsys"
 
     # ── Data split ─────────────────────────────────────────────────────────
-    eval_user_frac: float = 0.05
+    eval_user_frac: float = 0.2
     holdout_frac: float = 0.2
     min_ratings: int = 50
 
     # ── Simulation loop ────────────────────────────────────────────────────
     num_rounds: int = 10
-    rec_list_size: int = 20
+    rec_list_size: int = 6
     # Minimum number of acted-on (non-ignore) interactions per round.
     accept_k: int = 5
     max_requests_per_round: int = 3
@@ -79,7 +79,7 @@ class SimConfig:
     # ── Population mix ─────────────────────────────────────────────────────
     # Dict of archetype_name → proportion. Values are normalised at runtime.
     # e.g. {"casual": 0.6, "binger": 0.4}
-    archetype_mix: dict = field(default_factory=lambda: {"casual": 1.0})
+    archetype_mix: dict = field(default_factory=lambda: {"casual": .7, "binger": .2, "critic": .1 })
 
     def as_dict(self) -> dict:
         """Return a flat dict of all parameters (for MLflow logging)."""

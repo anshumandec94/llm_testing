@@ -17,7 +17,7 @@ each user.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class AgentPersona:
     """
-    Per-user state and behavioural configuration.
+    Per-user state and behavioral configuration.
 
     Fixed traits
     ------------
@@ -341,8 +341,8 @@ def build_population(
         # Resolve archetype config
         if arch_name in ARCHETYPE_REGISTRY:
             arch_cfg = ARCHETYPE_REGISTRY[arch_name]
-        elif hasattr(config, "archetype_configs") and arch_name in config.archetype_configs:
-            arch_cfg = config.archetype_configs[arch_name]
+        elif hasattr(config, "archetype_configs") and arch_name in config.archetype_configs:  # ty:ignore[unsupported-operator]
+            arch_cfg = config.archetype_configs[arch_name]  # ty:ignore[not-subscriptable]
         else:
             raise ValueError(
                 f"Archetype {arch_name!r} not found in ARCHETYPE_REGISTRY or "

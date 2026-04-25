@@ -37,6 +37,15 @@ COLLECTION_ASSOC = "associative_item_factors"
 COLLECTION_SEMANTIC = "semantic_movie_embeddings"
 COLLECTION_USER_PREF = "user_pref_item_factors"
 
+_CHROMA_BATCH_SIZE = 5000  # safely below ChromaDB's hard limit of 5461
+
+
+def _chroma_upsert_batched(col, ids: list, embeddings: list) -> None:
+    """Upsert in chunks to stay within ChromaDB's max batch size."""
+    for start in range(0, len(ids), _CHROMA_BATCH_SIZE):
+        end = start + _CHROMA_BATCH_SIZE
+        col.upsert(ids=ids[start:end], embeddings=embeddings[start:end])
+
 
 class Environment:
     """
@@ -208,7 +217,7 @@ class Environment:
 
         ids = [str(iid) for iid in item_vocab.ids()]
         embeddings = item_vectors.tolist()
-        col.upsert(ids=ids, embeddings=embeddings)
+        _chroma_upsert_batched(col, ids, embeddings)
         self._assoc_collection = col
 
         # Store user factors as a simple numpy dict (not in ChromaDB — too
@@ -295,7 +304,7 @@ class Environment:
             COLLECTION_SEMANTIC,
             metadata={"description": "Sentence-transformer movie content embeddings"},
         )
-        col.upsert(ids=movie_ids, embeddings=vectors.tolist())
+        _chroma_upsert_batched(col, movie_ids, vectors.tolist())
         self._semantic_collection = col
         logger.info("Semantic embeddings ready (%d movies).", len(movie_ids))
 
@@ -387,7 +396,7 @@ class Environment:
             metadata={"description": "TruncatedSVD item factors (user pref space)"},
         )
         ids = [str(int(mid)) for mid in item_ids_unique]
-        col.upsert(ids=ids, embeddings=V_norm.tolist())
+        _chroma_upsert_batched(col, ids, V_norm.tolist())
         self._user_pref_collection = col
 
         # Store user factors mapping uid → vector
@@ -442,7 +451,7 @@ class Environment:
         result = self._assoc_collection.get(ids=str_ids, include=["embeddings"])
         return {
             int(iid): np.array(vec)
-            for iid, vec in zip(result["ids"], result["embeddings"])
+            for iid, vec in zip(result["ids"], result["embeddings"])  # ty:ignore[invalid-argument-type]
         }
 
     def get_semantic_vectors(self, movie_ids: list[int]) -> dict[int, np.ndarray]:
@@ -451,7 +460,7 @@ class Environment:
         result = self._semantic_collection.get(ids=str_ids, include=["embeddings"])
         return {
             int(iid): np.array(vec)
-            for iid, vec in zip(result["ids"], result["embeddings"])
+            for iid, vec in zip(result["ids"], result["embeddings"])  # ty:ignore[invalid-argument-type]
         }
 
     def get_user_pref_item_factors(self, movie_ids: list[int]) -> dict[int, np.ndarray]:
@@ -466,7 +475,7 @@ class Environment:
         result = self._user_pref_collection.get(ids=str_ids, include=["embeddings"])
         return {
             int(iid): np.array(vec)
-            for iid, vec in zip(result["ids"], result["embeddings"])
+            for iid, vec in zip(result["ids"], result["embeddings"])  # ty:ignore[invalid-argument-type]
         }
 
     def get_user_pref_factor(self, user_id: int) -> np.ndarray | None:

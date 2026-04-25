@@ -213,6 +213,9 @@ class SimulationRunner:
                                 "movieId": iid,
                                 "rank": rank + 1,
                                 "is_held_out": iid in held_ids,
+                                # interaction fields filled in after the request loop
+                                "interaction": None,
+                                "signal": None,
                             })
 
                         # Stop when enough acted-on interactions collected
@@ -272,6 +275,14 @@ class SimulationRunner:
                     round_holdout_recalls.append(
                         len(surfaced[uid]) / len(held_ids) if held_ids else 0.0
                     )
+
+                    # Annotate shown items with what action (if any) the user took
+                    acted_lookup: dict[int, tuple[str, float]] = {
+                        mid: (action, sig) for mid, action, sig in round_interactions
+                    }
+                    for row in round_recs_rows:
+                        if row["movieId"] in acted_lookup:
+                            row["interaction"], row["signal"] = acted_lookup[row["movieId"]]
 
                     all_recs_rows.extend(round_recs_rows)
 
