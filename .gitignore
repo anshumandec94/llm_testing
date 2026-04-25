@@ -13,3 +13,8 @@ wheels/
 data/
 
 .DS_Store
+
+.vscode/
+mlruns/
+mlartifacts/
+embeddings/
