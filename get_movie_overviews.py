@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 load_dotenv()
 import pandas as pd
 from tqdm import tqdm
+from joblib import Parallel, delayed
 def load_movies_links_df():
     links_df = pd.read_csv("data/ml-32m/links.csv")
     return links_df
@@ -24,14 +25,17 @@ def get_movie_overview_for_tmdb_id(tmdb_id):
         return ""
 
 def get_movie_overviews():
-    tqdm.pandas()
     tmdb.API_KEY = os.getenv("TMDB_API_KEY")
     links_df = load_movies_links_df()
 
-    
-    links_df['overview'] = links_df['tmdbId'].progress_apply(lambda x: get_movie_overview_for_tmdb_id(x) if pd.notnull(x) else "")
-    
-    overviews_df = links_df[['movieId', 'overview']]
+    tmdb_ids = links_df["tmdbId"].tolist()
+    overviews = Parallel(n_jobs=-1, backend="threading")(
+        delayed(lambda x: get_movie_overview_for_tmdb_id(x) if pd.notnull(x) else "")(tid)
+        for tid in tqdm(tmdb_ids, desc="Fetching overviews")
+    )
+
+    links_df["overview"] = overviews
+    overviews_df = links_df[["movieId", "overview"]]
     overviews_df.to_csv("data/ml-32m/movie_overviews.csv", index=False)
 
 if __name__ == "__main__":
