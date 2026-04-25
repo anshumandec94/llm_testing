@@ -1803,6 +1803,7 @@ source = { editable = "." }
 dependencies = [
     { name = "chromadb" },
     { name = "ipykernel" },
+    { name = "joblib" },
     { name = "langchain-community" },
     { name = "lenskit" },
     { name = "mesa" },
@@ -1830,6 +1831,7 @@ dev = [
 requires-dist = [
     { name = "chromadb", specifier = ">=1.5.5" },
     { name = "ipykernel", specifier = ">=7.2.0" },
+    { name = "joblib", specifier = ">=1.5.3" },
     { name = "langchain-community", specifier = ">=0.4.1" },
     { name = "lenskit", specifier = ">=2026.1.0" },
     { name = "mesa", specifier = ">=3.3.1" },
