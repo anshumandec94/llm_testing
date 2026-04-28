@@ -97,7 +97,7 @@ class Recommender:
     def _seed_seen_from_training(self) -> None:
         """Pre-populate _all_seen with each user's training-set rated items."""
         for uid, group in self.env.train_ratings.groupby("userId"):
-            self._all_seen[int(uid)].update(group["movieId"].tolist())
+            self._all_seen[int(uid)].update(group["movieId"].tolist())  # ty:ignore[invalid-argument-type]
 
     def _build_and_train(self, dataset) -> None:
         scorer = BiasedMFScorer(features=self.config.mf_features)
