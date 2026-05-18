@@ -27,6 +27,7 @@ from lenskit.pipeline import topn_pipeline
 from sentence_transformers import SentenceTransformer
 from sklearn.decomposition import TruncatedSVD
 from sklearn.preprocessing import normalize
+from tqdm.auto import tqdm
 
 from sim.config import SimConfig
 
@@ -40,9 +41,19 @@ COLLECTION_USER_PREF = "user_pref_item_factors"
 _CHROMA_BATCH_SIZE = 5000  # safely below ChromaDB's hard limit of 5461
 
 
-def _chroma_upsert_batched(col, ids: list, embeddings: list) -> None:
+def _chroma_upsert_batched(
+    col, ids: list, embeddings: list, *, desc: str = "Upserting embeddings"
+) -> None:
     """Upsert in chunks to stay within ChromaDB's max batch size."""
-    for start in range(0, len(ids), _CHROMA_BATCH_SIZE):
+    starts = range(0, len(ids), _CHROMA_BATCH_SIZE)
+    iterator = tqdm(
+        starts,
+        desc=desc,
+        unit="batch",
+        leave=False,
+        disable=len(ids) <= _CHROMA_BATCH_SIZE,
+    )
+    for start in iterator:
         end = start + _CHROMA_BATCH_SIZE
         col.upsert(ids=ids[start:end], embeddings=embeddings[start:end])
 
@@ -138,7 +149,12 @@ class Environment:
         held_out_rows: list[pd.DataFrame] = []
         train_rows: list[pd.DataFrame] = []
 
-        for uid in self.eval_users:
+        for uid in tqdm(
+            self.eval_users,
+            desc="Creating holdout split",
+            unit="user",
+            leave=False,
+        ):
             user_df = ratings[ratings["userId"] == uid].sort_values(
                 "timestamp", ascending=False
             )
@@ -217,7 +233,12 @@ class Environment:
 
         ids = [str(iid) for iid in item_vocab.ids()]
         embeddings = item_vectors.tolist()
-        _chroma_upsert_batched(col, ids, embeddings)
+        _chroma_upsert_batched(
+            col,
+            ids,
+            embeddings,
+            desc="Upserting associative embeddings",
+        )
         self._assoc_collection = col
 
         # Store user factors as a simple numpy dict (not in ChromaDB — too
@@ -304,7 +325,12 @@ class Environment:
             COLLECTION_SEMANTIC,
             metadata={"description": "Sentence-transformer movie content embeddings"},
         )
-        _chroma_upsert_batched(col, movie_ids, vectors.tolist())
+        _chroma_upsert_batched(
+            col,
+            movie_ids,
+            vectors.tolist(),
+            desc="Upserting semantic embeddings",
+        )
         self._semantic_collection = col
         logger.info("Semantic embeddings ready (%d movies).", len(movie_ids))
 
@@ -396,7 +422,12 @@ class Environment:
             metadata={"description": "TruncatedSVD item factors (user pref space)"},
         )
         ids = [str(int(mid)) for mid in item_ids_unique]
-        _chroma_upsert_batched(col, ids, V_norm.tolist())
+        _chroma_upsert_batched(
+            col,
+            ids,
+            V_norm.tolist(),
+            desc="Upserting user-pref embeddings",
+        )
         self._user_pref_collection = col
 
         # Store user factors mapping uid → vector

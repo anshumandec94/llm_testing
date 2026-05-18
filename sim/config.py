@@ -26,6 +26,9 @@ class SimConfig:
     min_ratings: int = 50
 
     # ── Simulation loop ────────────────────────────────────────────────────
+    # "full" runs the existing simulation loop; "recommender_only" evaluates
+    # the raw LensKit factorization model on the first recommendation batch.
+    experiment_profile: str = "full"
     num_rounds: int = 10
     rec_list_size: int = 6
     # Minimum number of acted-on (non-ignore) interactions per round.
@@ -89,6 +92,7 @@ class SimConfig:
             "eval_user_frac": self.eval_user_frac,
             "holdout_frac": self.holdout_frac,
             "min_ratings": self.min_ratings,
+            "experiment_profile": self.experiment_profile,
             "num_rounds": self.num_rounds,
             "rec_list_size": self.rec_list_size,
             "accept_k": self.accept_k,

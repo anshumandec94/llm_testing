@@ -29,6 +29,7 @@ import mlflow
 import numpy as np
 import pandas as pd
 from lenskit.data import ItemList
+from tqdm.auto import tqdm
 
 from sim.config import SimConfig
 from sim.environment import Environment
@@ -56,6 +57,16 @@ class SimContext:
     rng: Any = None  # np.random.Generator, set in _setup_components
 
 
+@dataclass
+class RecommenderOnlyContext:
+    """State needed for first-batch raw recommender evaluation."""
+
+    env: Environment
+    recommender: Recommender
+    held_out_sets: dict[int, set[int]]
+    popularity_counts: pd.Series
+
+
 def _hit_rate(recs: ItemList, held_out_ids: set[int]) -> float:
     if not held_out_ids or len(recs) == 0:
         return 0.0
@@ -70,6 +81,36 @@ def _ndcg_at_k(recs: ItemList, relevant_ids: set[int], k: int) -> float:
     )
     ideal = sum(1.0 / np.log2(rank + 2) for rank in range(min(len(relevant_ids), k)))
     return float(dcg / ideal) if ideal > 0 else 0.0
+
+
+def _mean_std(values: np.ndarray) -> tuple[float, float]:
+    if len(values) == 0:
+        return 0.0, 0.0
+    return float(values.mean()), float(values.std(ddof=0))
+
+
+def _item_popularity(popularity_counts: pd.Series, item_ids: list[int]) -> np.ndarray:
+    if not item_ids:
+        return np.array([], dtype=float)
+    return popularity_counts.reindex(item_ids, fill_value=0).to_numpy(dtype=float)
+
+
+def _dot_scores(
+    user_vector: np.ndarray | None, item_vectors: dict[int, np.ndarray], item_ids: list[int]
+) -> tuple[np.ndarray, int]:
+    if user_vector is None or not item_ids:
+        return np.array([], dtype=float), 0
+
+    scores: list[float] = []
+    scored_count = 0
+    for mid in item_ids:
+        item_vector = item_vectors.get(mid)
+        if item_vector is None:
+            continue
+        scores.append(float(np.dot(user_vector, item_vector)))
+        scored_count += 1
+
+    return np.array(scores, dtype=float), scored_count
 
 
 class SimulationRunner:
@@ -89,22 +130,45 @@ class SimulationRunner:
         cfg = self.config
         t0 = time.time()
 
-        with mlflow.start_run(run_name=f"{cfg.agent_type}-seed{cfg.random_seed}"):
+        run_name = f"{cfg.experiment_profile}-{cfg.agent_type}-seed{cfg.random_seed}"
+        with mlflow.start_run(run_name=run_name):
             mlflow.log_params(cfg.as_dict())
+            mlflow.set_tags(
+                {
+                    "experiment_profile": cfg.experiment_profile,
+                    "agent_type": cfg.agent_type,
+                    "random_seed": str(cfg.random_seed),
+                    "run_kind": (
+                        "analysis"
+                        if cfg.experiment_profile == "recommender_only"
+                        else "simulation"
+                    ),
+                }
+            )
 
-            rng = np.random.default_rng(cfg.random_seed)
-            ctx = self._setup_components(rng)
+            if cfg.experiment_profile == "recommender_only":
+                summary_df = self._run_recommender_only()
+            else:
+                rng = np.random.default_rng(cfg.random_seed)
+                ctx = self._setup_components(rng)
 
-            round_records: list[dict] = []
-            for rnd in range(1, cfg.num_rounds + 1):
-                logger.info("--- Round %d / %d ---", rnd, cfg.num_rounds)
-                if rnd > 1:
-                    ctx.recommender.retrain()
-                metrics = self._run_round(rnd, ctx)
-                mlflow.log_metrics(metrics, step=rnd)
-                round_records.append({"round": rnd, **metrics})
+                round_records: list[dict] = []
+                round_iter = tqdm(
+                    range(1, cfg.num_rounds + 1),
+                    total=cfg.num_rounds,
+                    desc="Simulation rounds",
+                    unit="round",
+                    leave=False,
+                )
+                for rnd in round_iter:
+                    logger.info("--- Round %d / %d ---", rnd, cfg.num_rounds)
+                    if rnd > 1:
+                        ctx.recommender.retrain()
+                    metrics = self._run_round(rnd, ctx)
+                    mlflow.log_metrics(metrics, step=rnd)
+                    round_records.append({"round": rnd, **metrics})
 
-            summary_df = pd.DataFrame(round_records)
+                summary_df = pd.DataFrame(round_records)
             self._save_summary(summary_df)
             elapsed = time.time() - t0
             mlflow.log_metric("elapsed_seconds", elapsed)
@@ -143,6 +207,34 @@ class SimulationRunner:
             rng=rng,
         )
 
+    def _setup_recommender_only(self) -> RecommenderOnlyContext:
+        """Build only the pieces needed for raw first-batch evaluation."""
+        cfg = self.config
+
+        logger.info("=== Initialising Environment ===")
+        env = Environment(cfg)
+
+        logger.info("=== Initialising Recommender ===")
+        recommender = Recommender(cfg, env)
+
+        held_out_sets: dict[int, set[int]] = {
+            uid: set(env.held_out_for_user(uid)["movieId"].tolist())
+            for uid in env.eval_users
+        }
+        # Count popularity from training data so evaluation does not use
+        # held-out interactions as prior knowledge.
+        popularity_counts = env.train_ratings.groupby("movieId").size()
+        if not isinstance(popularity_counts, pd.Series):
+            raise TypeError("Expected popularity counts to be a pandas Series.")
+        popularity_counts = popularity_counts.astype(float)
+
+        return RecommenderOnlyContext(
+            env=env,
+            recommender=recommender,
+            held_out_sets=held_out_sets,
+            popularity_counts=popularity_counts,
+        )
+
     # ──────────────────────────────────────────────────────────────────────
     # Round-level loop
     # ──────────────────────────────────────────────────────────────────────
@@ -159,7 +251,14 @@ class SimulationRunner:
         action_counts: dict[str, int] = {"watch": 0, "rate": 0, "add_to_list": 0}
         all_recs_rows: list[dict] = []
 
-        for uid, ua in ctx.users.items():
+        user_iter = tqdm(
+            ctx.users.items(),
+            total=len(ctx.users),
+            desc=f"Round {rnd} users",
+            unit="user",
+            leave=False,
+        )
+        for uid, ua in user_iter:
             held_ids = ctx.held_out_sets[uid]
 
             attended, recs_rows, interactions, budget_delta = self._run_user_session(
@@ -233,6 +332,244 @@ class SimulationRunner:
             mlflow.log_artifact(str(recs_path), artifact_path="recs")
 
         return metrics
+
+    def _run_recommender_only(self) -> pd.DataFrame:
+        """Evaluate the raw recommender on the first batch only."""
+        ctx = self._setup_recommender_only()
+        cfg = self.config
+        user_rows: list[dict[str, float | int]] = []
+        rec_rows: list[dict[str, float | int]] = []
+
+        user_iter = tqdm(
+            ctx.env.eval_users,
+            total=len(ctx.env.eval_users),
+            desc="Evaluating users",
+            unit="user",
+            leave=False,
+        )
+        for uid in user_iter:
+            held_out_df = ctx.env.held_out_for_user(uid)
+            held_ids = ctx.held_out_sets[uid]
+            recs = ctx.recommender.recommend(uid, n=cfg.rec_list_size)
+
+            rec_ids = [int(iid) for iid in recs.ids()]
+            rec_pop = _item_popularity(ctx.popularity_counts, rec_ids)
+            cmp_ids = [int(mid) for mid in held_out_df["movieId"].tolist()]
+            cmp_pop = _item_popularity(ctx.popularity_counts, cmp_ids)
+            recommender_user = ctx.env.get_user_factor(uid)
+            internal_user = ctx.env.get_user_pref_factor(uid)
+            recommender_item_vectors = ctx.env.get_item_factors(cmp_ids)
+            internal_item_vectors = ctx.env.get_user_pref_item_factors(cmp_ids)
+            heldout_recommender_scores, heldout_recommender_scored_count = _dot_scores(
+                recommender_user, recommender_item_vectors, cmp_ids
+            )
+            heldout_internal_scores, heldout_internal_scored_count = _dot_scores(
+                internal_user, internal_item_vectors, cmp_ids
+            )
+
+            rec_mean, rec_std = _mean_std(rec_pop)
+            cmp_mean, cmp_std = _mean_std(cmp_pop)
+            hit_rate = _hit_rate(recs, held_ids)
+            ndcg = _ndcg_at_k(recs, held_ids, cfg.rec_list_size)
+            heldout_recommender_score_mean, heldout_recommender_score_std = _mean_std(
+                heldout_recommender_scores
+            )
+            heldout_internal_score_mean, heldout_internal_score_std = _mean_std(
+                heldout_internal_scores
+            )
+
+            user_rows.append(
+                {
+                    "userId": uid,
+                    "recommended_item_count": len(rec_ids),
+                    "heldout_item_count": len(cmp_ids),
+                    "hit_rate": hit_rate,
+                    f"ndcg_at_{cfg.rec_list_size}": ndcg,
+                    "recommended_popularity_mean": rec_mean,
+                    "recommended_popularity_std": rec_std,
+                    "heldout_popularity_mean": cmp_mean,
+                    "heldout_popularity_std": cmp_std,
+                    "popularity_mean_delta": rec_mean - cmp_mean,
+                    "heldout_recommender_scored_count": heldout_recommender_scored_count,
+                    "heldout_internal_scored_count": heldout_internal_scored_count,
+                    "heldout_recommender_score_mean": heldout_recommender_score_mean,
+                    "heldout_recommender_score_std": heldout_recommender_score_std,
+                    "heldout_internal_score_mean": heldout_internal_score_mean,
+                    "heldout_internal_score_std": heldout_internal_score_std,
+                    "heldout_score_mean_gap": (
+                        heldout_recommender_score_mean - heldout_internal_score_mean
+                    ),
+                    # Backward-compatible aliases for earlier artifact names.
+                    "comparison_item_count": len(cmp_ids),
+                    "comparison_popularity_mean": cmp_mean,
+                    "comparison_popularity_std": cmp_std,
+                }
+            )
+
+            for rank, mid in enumerate(rec_ids, start=1):
+                rec_rows.append(
+                    {
+                        "userId": uid,
+                        "rank": rank,
+                        "movieId": mid,
+                        "popularity": float(rec_pop[rank - 1]),
+                        "is_held_out_hit": int(mid in held_ids),
+                    }
+                )
+
+        user_df = pd.DataFrame(user_rows)
+        rec_df = pd.DataFrame(rec_rows)
+        metrics = {
+            "user_count": float(len(user_df)),
+            "hit_rate": float(user_df["hit_rate"].mean()) if not user_df.empty else 0.0,
+            f"ndcg_at_{cfg.rec_list_size}": float(user_df[f"ndcg_at_{cfg.rec_list_size}"].mean())
+            if not user_df.empty
+            else 0.0,
+            "fraction_users_with_holdout_hit": float((user_df["hit_rate"] > 0).mean())
+            if not user_df.empty
+            else 0.0,
+            "mean_user_recommended_popularity_mean": float(
+                user_df["recommended_popularity_mean"].mean()
+            )
+            if not user_df.empty
+            else 0.0,
+            "mean_user_recommended_popularity_std": float(
+                user_df["recommended_popularity_std"].mean()
+            )
+            if not user_df.empty
+            else 0.0,
+            "mean_user_heldout_popularity_mean": float(user_df["heldout_popularity_mean"].mean())
+            if not user_df.empty
+            else 0.0,
+            "mean_user_heldout_popularity_std": float(user_df["heldout_popularity_std"].mean())
+            if not user_df.empty
+            else 0.0,
+            "mean_user_comparison_popularity_mean": float(
+                user_df["comparison_popularity_mean"].mean()
+            )
+            if not user_df.empty
+            else 0.0,
+            "mean_user_comparison_popularity_std": float(
+                user_df["comparison_popularity_std"].mean()
+            )
+            if not user_df.empty
+            else 0.0,
+            "mean_user_popularity_mean_delta": float(user_df["popularity_mean_delta"].mean())
+            if not user_df.empty
+            else 0.0,
+            "std_user_popularity_mean_delta": float(
+                user_df["popularity_mean_delta"].std(ddof=0)
+            )
+            if not user_df.empty
+            else 0.0,
+            "mean_user_heldout_recommender_score_mean": float(
+                user_df["heldout_recommender_score_mean"].mean()
+            )
+            if not user_df.empty
+            else 0.0,
+            "mean_user_heldout_recommender_score_std": float(
+                user_df["heldout_recommender_score_std"].mean()
+            )
+            if not user_df.empty
+            else 0.0,
+            "mean_user_heldout_internal_score_mean": float(
+                user_df["heldout_internal_score_mean"].mean()
+            )
+            if not user_df.empty
+            else 0.0,
+            "mean_user_heldout_internal_score_std": float(
+                user_df["heldout_internal_score_std"].mean()
+            )
+            if not user_df.empty
+            else 0.0,
+            "mean_user_heldout_score_mean_gap": float(
+                user_df["heldout_score_mean_gap"].mean()
+            )
+            if not user_df.empty
+            else 0.0,
+            "std_user_heldout_score_mean_gap": float(
+                user_df["heldout_score_mean_gap"].std(ddof=0)
+            )
+            if not user_df.empty
+            else 0.0,
+            "fraction_users_recommender_score_mean_gt_internal": float(
+                (
+                    user_df["heldout_recommender_score_mean"]
+                    > user_df["heldout_internal_score_mean"]
+                ).mean()
+            )
+            if not user_df.empty
+            else 0.0,
+            "fraction_users_recommended_mean_gt_comparison_mean": float(
+                (
+                    user_df["recommended_popularity_mean"]
+                    > user_df["comparison_popularity_mean"]
+                ).mean()
+            )
+            if not user_df.empty
+            else 0.0,
+        }
+
+        mlflow.log_metrics(metrics)
+
+        artifact_dir = Path("mlartifacts")
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+
+        user_diag_path = artifact_dir / "recommender_only_user_diagnostics.parquet"
+        user_df.to_parquet(user_diag_path, index=False)
+        mlflow.log_artifact(str(user_diag_path), artifact_path="diagnostics")
+
+        recs_path = artifact_dir / "recommender_only_recommendations.parquet"
+        rec_df.to_parquet(recs_path, index=False)
+        mlflow.log_artifact(str(recs_path), artifact_path="recs")
+
+        heldout_score_rows: list[dict[str, float | int]] = []
+        for uid in ctx.env.eval_users:
+            held_out_df = ctx.env.held_out_for_user(uid)
+            held_ids = [int(mid) for mid in held_out_df["movieId"].tolist()]
+            ratings_by_movie = {
+                int(mid): float(rating)
+                for mid, rating in zip(held_out_df["movieId"], held_out_df["rating"])
+            }
+            recommender_user = ctx.env.get_user_factor(uid)
+            internal_user = ctx.env.get_user_pref_factor(uid)
+            recommender_item_vectors = ctx.env.get_item_factors(held_ids)
+            internal_item_vectors = ctx.env.get_user_pref_item_factors(held_ids)
+
+            for mid in held_ids:
+                recommender_item = recommender_item_vectors.get(mid)
+                internal_item = internal_item_vectors.get(mid)
+                heldout_score_rows.append(
+                    {
+                        "userId": uid,
+                        "movieId": mid,
+                        "rating": ratings_by_movie[mid],
+                        "recommender_score": float(np.dot(recommender_user, recommender_item))
+                        if recommender_user is not None and recommender_item is not None
+                        else np.nan,
+                        "internal_score": float(np.dot(internal_user, internal_item))
+                        if internal_user is not None and internal_item is not None
+                        else np.nan,
+                    }
+                )
+
+        heldout_scores_path = artifact_dir / "recommender_only_heldout_scores.parquet"
+        pd.DataFrame(heldout_score_rows).to_parquet(heldout_scores_path, index=False)
+        mlflow.log_artifact(str(heldout_scores_path), artifact_path="diagnostics")
+
+        logger.info(
+            "  raw hit=%.4f  ndcg@%d=%.4f  rec_pop=%.2f  held_pop=%.2f  "
+            "score(rec)=%.4f  score(int)=%.4f",
+            metrics["hit_rate"],
+            cfg.rec_list_size,
+            metrics[f"ndcg_at_{cfg.rec_list_size}"],
+            metrics["mean_user_recommended_popularity_mean"],
+            metrics["mean_user_heldout_popularity_mean"],
+            metrics["mean_user_heldout_recommender_score_mean"],
+            metrics["mean_user_heldout_internal_score_mean"],
+        )
+
+        return pd.DataFrame([{"round": 1, **metrics}])
 
     # ──────────────────────────────────────────────────────────────────────
     # User-session-level logic
