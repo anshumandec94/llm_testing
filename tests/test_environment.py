@@ -10,9 +10,6 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from sim.environment import COLLECTION_ASSOC, COLLECTION_SEMANTIC, COLLECTION_USER_PREF
-
-
 class TestDataLoading:
     def test_train_ratings_not_empty(self, env):
         assert len(env.train_ratings) > 0
@@ -27,14 +24,21 @@ class TestDataLoading:
     def test_train_and_held_out_are_disjoint(self, env):
         """No (userId, movieId) pair should appear in both splits."""
         train_pairs = set(zip(env.train_ratings["userId"], env.train_ratings["movieId"]))
+        validation_pairs = set(zip(env.validation["userId"], env.validation["movieId"]))
         held_pairs = set(zip(env.held_out["userId"], env.held_out["movieId"]))
-        overlap = train_pairs & held_pairs
-        assert len(overlap) == 0, f"{len(overlap)} pairs appear in both train and held-out"
+        assert len(train_pairs & validation_pairs) == 0
+        assert len(train_pairs & held_pairs) == 0
+        assert len(validation_pairs & held_pairs) == 0
 
     def test_held_out_only_for_eval_users(self, env):
         held_users = set(env.held_out["userId"].unique())
         eval_users = set(env.eval_users)
         assert held_users.issubset(eval_users)
+
+    def test_validation_only_for_eval_users(self, env):
+        validation_users = set(env.validation["userId"].unique())
+        eval_users = set(env.eval_users)
+        assert validation_users.issubset(eval_users)
 
 
 class TestHoldOutSplit:
@@ -56,14 +60,26 @@ class TestHoldOutSplit:
                 f"User {uid}: expected {expected} held-out ratings, got {user_held}"
             )
 
+    def test_validation_split_exists_for_eval_users(self, env, tiny_config):
+        for uid in env.eval_users:
+            user_total = len(env.all_ratings[env.all_ratings["userId"] == uid])
+            user_validation = len(env.validation[env.validation["userId"] == uid])
+            if tiny_config.validation_frac <= 0:
+                assert user_validation == 0
+                continue
+            expected = max(1, int(user_total * tiny_config.validation_frac))
+            held_out_count = max(1, int(user_total * tiny_config.holdout_frac))
+            max_available = max(0, user_total - held_out_count - 1)
+            assert user_validation == min(expected, max_available)
+
 
 class TestAssociativeEmbeddings:
     def test_collection_exists(self, env):
-        col = env.chroma_client.get_collection(COLLECTION_ASSOC)
+        col = env.chroma_client.get_collection(env.assoc_collection_name)
         assert col is not None
 
     def test_collection_has_items(self, env):
-        col = env.chroma_client.get_collection(COLLECTION_ASSOC)
+        col = env.chroma_client.get_collection(env.assoc_collection_name)
         assert col.count() > 0
 
     def test_get_item_factors_returns_dict(self, env):
@@ -82,9 +98,7 @@ class TestAssociativeEmbeddings:
             )
 
     def test_user_factors_persisted_on_disk(self, env, tiny_config):
-        import pathlib
-        factors_path = pathlib.Path(tiny_config.embeddings_dir) / "user_factors.npz"
-        assert factors_path.exists(), "user_factors.npz not written to disk"
+        assert env.user_factor_cache_path.exists(), "user_factors cache not written to disk"
 
     def test_get_user_factor_returns_vector_for_known_user(self, env, tiny_config):
         # At least some eval users should be in the training set
@@ -100,11 +114,11 @@ class TestAssociativeEmbeddings:
 
 class TestSemanticEmbeddings:
     def test_collection_exists(self, env):
-        col = env.chroma_client.get_collection(COLLECTION_SEMANTIC)
+        col = env.chroma_client.get_collection(env.semantic_collection_name)
         assert col is not None
 
     def test_collection_has_items(self, env):
-        col = env.chroma_client.get_collection(COLLECTION_SEMANTIC)
+        col = env.chroma_client.get_collection(env.semantic_collection_name)
         assert col.count() > 0
 
     def test_semantic_vectors_have_nonzero_dimensionality(self, env):
@@ -130,11 +144,11 @@ class TestSemanticEmbeddings:
 
 class TestUserPrefEmbeddings:
     def test_collection_exists(self, env):
-        col = env.chroma_client.get_collection(COLLECTION_USER_PREF)
+        col = env.chroma_client.get_collection(env.user_pref_collection_name)
         assert col is not None
 
     def test_collection_has_items(self, env):
-        col = env.chroma_client.get_collection(COLLECTION_USER_PREF)
+        col = env.chroma_client.get_collection(env.user_pref_collection_name)
         assert col.count() > 0
 
     def test_get_user_pref_item_factors_returns_dict(self, env):
@@ -153,9 +167,9 @@ class TestUserPrefEmbeddings:
             )
 
     def test_user_pref_factors_persisted_on_disk(self, env, tiny_config):
-        import pathlib
-        factors_path = pathlib.Path(tiny_config.embeddings_dir) / "user_pref_factors.npz"
-        assert factors_path.exists(), "user_pref_factors.npz not written to disk"
+        assert env.user_pref_factor_cache_path.exists(), (
+            "user_pref_factors cache not written to disk"
+        )
 
     def test_get_user_pref_factor_for_known_user(self, env, tiny_config):
         found = False

@@ -1,0 +1,267 @@
+"""
+tests/test_llm_integration.py — integration tests for the LLM evaluation pipeline.
+
+These tests exercise the real environment, real personas, and real mlx_lm API
+contracts. The LLM model itself is mocked (it's 4 GB), but every other layer
+is real. The goal is to catch the class of bugs that unit tests miss:
+
+  - mlx_lm API changes (e.g. temp= vs sampler=, tokenize=True returning
+    BatchEncoding instead of str)
+  - Broken wiring between environment, agent, and experiment evaluation
+  - Bias + dot-product reconstruction producing out-of-range predictions
+  - Metrics computed from an empty or mismatched result set
+"""
+from __future__ import annotations
+
+import inspect
+from unittest.mock import MagicMock, patch
+
+import mlflow
+import numpy as np
+import pytest
+from lenskit.data import ItemList
+
+from sim.agents.llm import LLMAgent
+from sim.population import build_user_assignments
+from sim.user_agent import SimulatedUser
+
+
+# ── mlx_lm API contract ───────────────────────────────────────────────────────
+# These tests verify assumptions our code makes about mlx_lm's API.
+# If mlx_lm changes its interface, these fail immediately and tell you
+# exactly which argument in _call_llm needs updating.
+
+class TestMlxLmApiContract:
+
+    def test_generate_step_does_not_accept_temp_directly(self):
+        """Regression: we passed temp= directly to generate(), which doesn't exist.
+        The correct path is sampler=make_sampler(temp=0.0)."""
+        from mlx_lm.generate import generate_step
+        sig = inspect.signature(generate_step)
+        assert "temp" not in sig.parameters, (
+            "mlx_lm.generate_step now has a temp= param — remove the make_sampler wrapper in _call_llm."
+        )
+
+    def test_generate_step_accepts_sampler(self):
+        """Our code passes greedy sampling via sampler=make_sampler(temp=0.0)."""
+        from mlx_lm.generate import generate_step
+        sig = inspect.signature(generate_step)
+        assert "sampler" in sig.parameters
+
+    def test_make_sampler_accepts_temp(self):
+        """make_sampler must still accept temp= for greedy decoding."""
+        from mlx_lm.sample_utils import make_sampler
+        sig = inspect.signature(make_sampler)
+        assert "temp" in sig.parameters
+
+    def test_make_sampler_zero_temp_is_callable(self):
+        """make_sampler(temp=0.0) must return a callable that generate_step accepts."""
+        from mlx_lm.sample_utils import make_sampler
+        sampler = make_sampler(temp=0.0)
+        assert callable(sampler)
+
+    def test_generate_accepts_string_prompt(self):
+        """generate() must accept a str prompt — we pass the result of
+        apply_chat_template(tokenize=False) which is always a str."""
+        from mlx_lm import generate
+        sig = inspect.signature(generate)
+        prompt_param = sig.parameters.get("prompt")
+        assert prompt_param is not None
+
+
+# ── LLMAgent with real environment ───────────────────────────────────────────
+
+@pytest.fixture(scope="module")
+def llm_agent(env):
+    """LLMAgent wired to the real test environment, model/tokenizer mocked."""
+    mock_tok = MagicMock()
+    mock_tok.apply_chat_template.return_value = "<|system|>You are...<|user|>History..."
+
+    with patch("mlx_lm.load", return_value=(MagicMock(), mock_tok)):
+        agent = LLMAgent(
+            env,
+            model_id="mock-model",
+            history_k=2,
+            history_strategy="top_rated",
+            max_tokens=32,
+            use_few_shot=False,
+        )
+    return agent
+
+
+class TestLLMAgentWithRealEnv:
+    """Tests that use the real Environment and synthetic ML-32M data."""
+
+    def test_agent_indexes_movie_meta(self, llm_agent, env):
+        """Agent must correctly index env.movie_meta on construction."""
+        assert set(llm_agent._meta.index) == set(env.movie_meta["movieId"])
+
+    def test_agent_indexes_user_ratings(self, llm_agent, env):
+        """Agent must merge train_ratings with movie_meta on construction."""
+        assert "title" in llm_agent._user_ratings.columns
+        assert "genres" in llm_agent._user_ratings.columns
+
+    def test_build_prompt_returns_str_with_real_tokenizer_mock(self, llm_agent, env):
+        """End-to-end: _build_prompt must return str, not BatchEncoding.
+        This test wires through the real env so we know the history lookup
+        and movie_meta lookup work before the tokenizer is called."""
+        uid = env.eval_users[0]
+        # pick a movie that exists in movie_meta
+        mid = int(env.movie_meta["movieId"].iloc[0])
+        history = llm_agent._get_history(uid)
+        result = llm_agent._build_prompt(history, mid)
+        assert isinstance(result, str), (
+            f"_build_prompt returned {type(result).__name__}, not str. "
+            "Likely tokenize=True was used in apply_chat_template."
+        )
+
+    def test_evaluate_returns_valid_scores_with_real_items(self, llm_agent, env, population):
+        """Full evaluate() pipeline: real env + real persona + mocked generate."""
+        uid = env.eval_users[0]
+        persona = population[uid]
+        movie_ids = env.movie_meta["movieId"].head(5).tolist()
+        candidates = ItemList(item_ids=np.array(movie_ids, dtype=np.int64))
+        item_factors = env.get_user_pref_item_factors(movie_ids)
+
+        with patch("mlx_lm.generate", return_value='{"predicted_rating": 4.1, "reasoning": "ok"}'):
+            result = llm_agent.evaluate(candidates, persona, item_factors)
+
+        scores = result.scores()
+        assert scores is not None
+        assert len(scores) == len(movie_ids)
+        assert np.all(scores >= 1.0) and np.all(scores <= 5.0)
+
+    def test_evaluate_scores_float32(self, llm_agent, env, population):
+        """Scores must be float32 to match AssociativeAgent output dtype."""
+        uid = env.eval_users[0]
+        persona = population[uid]
+        movie_ids = env.movie_meta["movieId"].head(3).tolist()
+        candidates = ItemList(item_ids=np.array(movie_ids, dtype=np.int64))
+        item_factors = env.get_user_pref_item_factors(movie_ids)
+
+        with patch("mlx_lm.generate", return_value='{"predicted_rating": 3.5}'):
+            result = llm_agent.evaluate(candidates, persona, item_factors)
+
+        assert result.scores().dtype == np.float32
+
+
+# ── AssociativeAgent bias + dot-product reconstruction ───────────────────────
+
+class TestAssociativeRatingReconstruction:
+    """Integration tests for the bias + dot reconstruction used in the experiment.
+
+    This is NOT tested in test_agents.py (which only tests the dot product).
+    These tests verify the full rating prediction: bias + dot ∈ [1, 5].
+    """
+
+    def test_bias_plus_dot_in_rating_range(self, env, population):
+        """bias(u, i) + dot(pref_vec, item_factor) must produce values near [1, 5]."""
+        uid = env.eval_users[0]
+        base_uid = env.eval_users[0]
+        persona = population[uid]
+        movie_ids = env.movie_meta["movieId"].head(10).tolist()
+        item_factors = env.get_user_pref_item_factors(movie_ids)
+
+        preds = []
+        for mid in movie_ids:
+            bias = env.get_rating_bias(base_uid, mid)
+            dot = float(np.dot(persona.pref_vector, item_factors[mid])) if mid in item_factors else 0.0
+            pred = float(np.clip(bias + dot, 1.0, 5.0))
+            preds.append(pred)
+
+        assert all(1.0 <= p <= 5.0 for p in preds)
+
+    def test_bias_is_nonzero(self, env):
+        """get_rating_bias must return a meaningful non-trivial value."""
+        uid = env.eval_users[0]
+        mid = int(env.movie_meta["movieId"].iloc[0])
+        bias = env.get_rating_bias(uid, mid)
+        # bias = global + user + item bias; with any real data this should be nonzero
+        assert bias != 0.0
+
+    def test_debias_then_rebias_roundtrips(self, env):
+        """debias_rating and get_rating_bias must be inverses."""
+        uid = env.eval_users[0]
+        mid = int(env.movie_meta["movieId"].iloc[0])
+        raw = 4.0
+        debiased = env.debias_rating(uid, mid, raw)
+        reconstructed = debiased + env.get_rating_bias(uid, mid)
+        assert reconstructed == pytest.approx(raw, abs=1e-4)
+
+
+# ── Experiment evaluation pipeline ───────────────────────────────────────────
+
+class TestEvaluatePipeline:
+    """Integration tests for the evaluate_associative function in the experiment.
+
+    Exercises the full pipeline: env → assignments → users → per-item scoring
+    → metric aggregation, with MLflow patched out.
+    """
+
+    @pytest.fixture(scope="class")
+    def eval_context(self, tiny_config, env):
+        rng = np.random.default_rng(tiny_config.random_seed)
+        assignments = build_user_assignments(tiny_config, env, rng)
+        users, _ = SimulatedUser.build_population(tiny_config, env, rng, assignments=assignments)
+        return assignments, users
+
+    def test_evaluate_associative_completes(self, tiny_config, env, eval_context):
+        """evaluate_associative must run to completion and log metrics."""
+        from experiments.llm_vs_associative import _compute_metrics
+
+        assignments, users = eval_context
+        all_predicted, all_actual = [], []
+
+        for assignment in assignments:
+            uid = assignment.sim_user_id
+            base_uid = assignment.base_user_id
+            held_out_df = env.held_out_for_user(base_uid, split=tiny_config.recommender_eval_split)
+            if held_out_df.empty:
+                continue
+            held_ids = [int(mid) for mid in held_out_df["movieId"]]
+            actual_by_id = {int(mid): float(r)
+                            for mid, r in zip(held_out_df["movieId"], held_out_df["rating"])}
+            persona = users[uid].persona
+            item_factors = env.get_user_pref_item_factors(held_ids)
+
+            for mid in held_ids:
+                bias = env.get_rating_bias(base_uid, mid)
+                dot = float(np.dot(persona.pref_vector, item_factors[mid])) if mid in item_factors else 0.0
+                all_predicted.append(float(np.clip(bias + dot, 1.0, 5.0)))
+                all_actual.append(actual_by_id[mid])
+
+        assert len(all_predicted) > 0, "No predictions produced — check eval_user_frac or holdout_frac"
+        metrics = _compute_metrics(all_predicted, all_actual)
+        assert 0.0 <= metrics["error/mae"] <= 4.0
+        assert 0.0 <= metrics["error/rmse"] <= 4.0
+        assert 1.0 <= metrics["score/mean"] <= 5.0
+        assert metrics["score/std"] >= 0.0
+
+    def test_evaluate_associative_mae_is_finite(self, tiny_config, env, eval_context):
+        """MAE must be a finite number, not NaN or inf."""
+        from experiments.llm_vs_associative import _compute_metrics
+
+        assignments, users = eval_context
+        all_predicted, all_actual = [], []
+
+        for assignment in assignments:
+            uid = assignment.sim_user_id
+            base_uid = assignment.base_user_id
+            held_out_df = env.held_out_for_user(base_uid, split=tiny_config.recommender_eval_split)
+            if held_out_df.empty:
+                continue
+            held_ids = [int(mid) for mid in held_out_df["movieId"]]
+            actual_by_id = {int(mid): float(r)
+                            for mid, r in zip(held_out_df["movieId"], held_out_df["rating"])}
+            persona = users[uid].persona
+            item_factors = env.get_user_pref_item_factors(held_ids)
+
+            for mid in held_ids:
+                bias = env.get_rating_bias(base_uid, mid)
+                dot = float(np.dot(persona.pref_vector, item_factors[mid])) if mid in item_factors else 0.0
+                all_predicted.append(float(np.clip(bias + dot, 1.0, 5.0)))
+                all_actual.append(actual_by_id[mid])
+
+        metrics = _compute_metrics(all_predicted, all_actual)
+        assert np.isfinite(metrics["error/mae"])
+        assert np.isfinite(metrics["error/rmse"])

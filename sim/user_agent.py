@@ -29,6 +29,8 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 from lenskit.data import ItemList
+from sim.agents import build_agent
+from sim.population import UserAssignment, build_user_assignments
 
 if TYPE_CHECKING:
     from sim.config import SimConfig
@@ -36,28 +38,6 @@ if TYPE_CHECKING:
     from sim.persona import AgentPersona
 
 logger = logging.getLogger(__name__)
-
-
-def _build_agent(config: SimConfig, env: Environment):
-    """Instantiate the scoring agent specified in config.agent_type."""
-    if config.agent_type == "associative":
-        from sim.agents.associative import AssociativeAgent
-
-        return AssociativeAgent(env)
-    elif config.agent_type == "semantic":
-        from sim.agents.semantic import SemanticAgent
-
-        return SemanticAgent(env)
-    elif config.agent_type == "seq2seq":
-        from sim.agents.seq2seq import Seq2SeqAgent
-
-        return Seq2SeqAgent(env)
-    elif config.agent_type == "llm":
-        from sim.agents.llm import LLMAgent
-
-        return LLMAgent(env)
-    else:
-        raise ValueError(f"Unknown agent_type: {config.agent_type!r}")
 
 
 class SimulatedUser:
@@ -80,8 +60,17 @@ class SimulatedUser:
         user to it during update calls.
     """
 
-    def __init__(self, uid: int, persona: AgentPersona, agent) -> None:
+    def __init__(
+        self,
+        uid: int,
+        base_user_id: int,
+        agent_type: str,
+        persona: AgentPersona,
+        agent,
+    ) -> None:
         self.uid = uid
+        self.base_user_id = base_user_id
+        self.agent_type = agent_type
         self.persona = persona
         self._agent = agent
 
@@ -91,11 +80,12 @@ class SimulatedUser:
         config: SimConfig,
         env: Environment,
         rng,
-    ) -> dict[int, SimulatedUser]:
+        assignments: list[UserAssignment] | None = None,
+    ) -> tuple[dict[int, SimulatedUser], list[UserAssignment]]:
         """Build the full population of SimulatedUsers for a simulation run.
 
-        Creates the shared scoring agent once (all users share one instance),
-        then wraps each user's AgentPersona in a SimulatedUser.
+        Creates one shared scoring agent per configured agent type, then wraps
+        each assigned persona in a SimulatedUser.
 
         Parameters
         ----------
@@ -108,20 +98,41 @@ class SimulatedUser:
 
         Returns
         -------
-        A dict mapping user ID → SimulatedUser for every eval user.
+        A pair of (population, assignments), where population maps simulated
+        user ID → SimulatedUser.
         """
-        from sim.persona import build_population as _build_personas
+        from dataclasses import replace
 
-        logger.info("=== Initialising Agent (%s) ===", config.agent_type)
-        agent = _build_agent(config, env)
+        from sim.persona import build_population_for_assignments
+
+        if assignments is None:
+            assignments = build_user_assignments(config, env, rng)
+        agent_types = sorted({assignment.agent_type for assignment in assignments})
+        agents = {
+            agent_type: build_agent(replace(config, agent_type=agent_type), env)
+            for agent_type in agent_types
+        }
 
         logger.info("=== Building Agent Population ===")
-        population = _build_personas(config, env, rng)
+        population = build_population_for_assignments(config, env, assignments, rng)
 
-        return {
-            uid: cls(uid, persona, agent)
-            for uid, persona in population.items()
-        }
+        return (
+            {
+                assignment.sim_user_id: cls(
+                    assignment.sim_user_id,
+                    assignment.base_user_id,
+                    assignment.agent_type,
+                    population[assignment.sim_user_id],
+                    agents[assignment.agent_type],
+                )
+                for assignment in assignments
+            },
+            assignments,
+        )
+
+    @property
+    def agent(self):
+        return self._agent
 
     @property
     def budget(self) -> float:
@@ -217,7 +228,9 @@ class SimulatedUser:
             row = {
                 "round": rnd,
                 "request": req + 1,
-                "userId": self.uid,
+                "userId": self.base_user_id,
+                "simulation_user_id": self.uid,
+                "agent_type": self.agent_type,
                 "movieId": iid,
                 "rank": rank + 1,
                 "is_held_out": iid in held_ids,
@@ -254,7 +267,9 @@ class SimulatedUser:
         rnd:
             Current round number.
         interactions:
-            List of (movieId, action, signal) tuples from this round.
+            List of explicit-rating feedback tuples for learning updates.
+            The signal value is the debiased rating residual, not the raw
+            action signal.
         acted_item_factors:
             Item factor vectors for the interacted-with items. Pre-fetched by
             the caller (runner has the env reference).

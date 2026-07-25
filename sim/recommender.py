@@ -66,9 +66,16 @@ class Recommender:
         Initialised Environment (provides ``dataset`` and movie metadata).
     """
 
-    def __init__(self, config: SimConfig, env: Environment) -> None:
+    def __init__(
+        self,
+        config: SimConfig,
+        env: Environment,
+        user_base_map: dict[int, int] | None = None,
+    ) -> None:
         self.config = config
         self.env = env
+        self._user_base_map = user_base_map or {}
+        self._expanded_train_ratings = self._build_expanded_train_ratings()
 
         # Accumulated feedback: userId → list of (movieId, rating) tuples
         self._feedback: dict[int, list[tuple[int, float]]] = defaultdict(list)
@@ -85,22 +92,48 @@ class Recommender:
 
         # Build and train the initial pipeline
         logger.info(
-            "Training initial LensKit BiasedMF pipeline (features=%d) …",
+            "Training initial LensKit BiasedMF pipeline (features=%d, epochs=%d, regularization=%.4f) …",
             config.mf_features,
+            config.mf_epochs,
+            config.mf_regularization,
         )
-        self._build_and_train(env.dataset)
+        self._build_and_train(self._expanded_train_ratings)
 
     # ──────────────────────────────────────────────────────────────────────
     # Private helpers
     # ──────────────────────────────────────────────────────────────────────
 
+    def _build_expanded_train_ratings(self) -> pd.DataFrame:
+        """Return train ratings with replicated simulated users cloned from base users."""
+        train = self.env.train_ratings[["userId", "movieId", "rating", "timestamp"]].copy()
+        extra_rows: list[pd.DataFrame] = []
+        for sim_user_id, base_user_id in self._user_base_map.items():
+            if sim_user_id == base_user_id:
+                continue
+            base_rows = train[train["userId"] == base_user_id].copy()
+            if base_rows.empty:
+                continue
+            base_rows["userId"] = sim_user_id
+            extra_rows.append(base_rows)
+
+        if extra_rows:
+            train = pd.concat([train, *extra_rows], ignore_index=True)
+        return train
+
     def _seed_seen_from_training(self) -> None:
         """Pre-populate _all_seen with each user's training-set rated items."""
-        for uid, group in self.env.train_ratings.groupby("userId"):
+        for uid, group in self._expanded_train_ratings.groupby("userId"):
             self._all_seen[int(uid)].update(group["movieId"].tolist())  # ty:ignore[invalid-argument-type]
 
-    def _build_and_train(self, dataset) -> None:
-        scorer = BiasedMFScorer(features=self.config.mf_features)
+    def _build_and_train(self, ratings_df: pd.DataFrame) -> None:
+        dataset = from_interactions_df(
+            ratings_df,
+            user_col="userId",
+            item_col="movieId",
+            rating_col="rating",
+            timestamp_col="timestamp",
+        )
+        scorer = BiasedMFScorer(**self.config.platform_mf_kwargs())
         self._pipeline = topn_pipeline(scorer)
         self._pipeline.train(dataset)
 
@@ -183,16 +216,17 @@ class Recommender:
 
     def update_user(self, user_id: int, interactions: list[tuple[int, float]]) -> None:
         """
-        Record acted-on items as feedback for the recommender.
+        Record explicit user ratings as feedback for the recommender.
 
         Parameters
         ----------
         user_id:
             The user who interacted with items.
         interactions:
-            List of ``(movie_id, signal_strength)`` tuples. Signal strength
-            is the action-derived value in [0, 5] (watch≈4.5, rate=sampled,
-            add_to_list≈3.0). An empty list is a no-op.
+            List of ``(movie_id, raw_rating)`` tuples from explicit ``rate``
+            actions only. Ratings stay on the original scale because
+            ``BiasedMF`` learns the bias decomposition internally. An empty
+            list is a no-op.
 
         Items passed here are also added to ``_all_seen`` so they will not
         be recommended again in future rounds.
@@ -233,22 +267,15 @@ class Recommender:
 
         combined = pd.concat(
             [
-                self.env.train_ratings[["userId", "movieId", "rating", "timestamp"]],
+                self._expanded_train_ratings,
                 feedback_df,
             ],
             ignore_index=True,
         ).drop_duplicates(subset=["userId", "movieId"], keep="last")
 
-        updated_dataset = from_interactions_df(
-            combined,
-            user_col="userId",
-            item_col="movieId",
-            rating_col="rating",
-            timestamp_col="timestamp",
-        )
         logger.info(
             "Retraining recommender on %d ratings (%d feedback events) …",
             len(combined),
             len(feedback_rows),
         )
-        self._build_and_train(updated_dataset)
+        self._build_and_train(combined)

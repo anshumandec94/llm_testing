@@ -6,7 +6,9 @@ so that experiments are fully reproducible and self-documenting in MLflow.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import hashlib
+import json
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 
 
@@ -17,11 +19,12 @@ class SimConfig:
     embeddings_dir: Path = field(default_factory=lambda: Path("embeddings/chroma"))
 
     # ── MLflow ─────────────────────────────────────────────────────────────
-    mlflow_tracking_uri: str = "mlruns"
+    mlflow_tracking_uri: str = "sqlite:///mlflow.db"
     experiment_name: str = "abm-recsys"
 
     # ── Data split ─────────────────────────────────────────────────────────
     eval_user_frac: float = 0.2
+    validation_frac: float = 0.1
     holdout_frac: float = 0.2
     min_ratings: int = 50
 
@@ -29,14 +32,21 @@ class SimConfig:
     # "full" runs the existing simulation loop; "recommender_only" evaluates
     # the raw LensKit factorization model on the first recommendation batch.
     experiment_profile: str = "full"
+    recommender_eval_split: str = "held_out"
     num_rounds: int = 10
     rec_list_size: int = 6
     # Minimum number of acted-on (non-ignore) interactions per round.
     accept_k: int = 5
     max_requests_per_round: int = 3
+    # k values for NDCG evaluation in recommender_only mode.
+    # Larger k gives more interpretable ranking quality signals against a large catalog.
+    ndcg_eval_ks: list[int] = field(default_factory=lambda: [10, 20, 50])
 
     # ── Recommender (LensKit BiasedMF / ALS) ───────────────────────────────
     mf_features: int = 64
+    mf_epochs: int = 10
+    mf_regularization: float = 0.1
+    mf_damping: float = 5.0
 
     # ── User preference model (small independent MF via TruncatedSVD) ──────
     # Dimensionality of the user's internal preference representation.
@@ -53,8 +63,12 @@ class SimConfig:
     force_rebuild_embeddings: bool = False
 
     # ── Agent ───────────────────────────────────────────────────────────────
-    # One of: "associative", "semantic", "seq2seq", "llm"
+    # One of: "associative", "associative_baseline", "residual_profile",
+    # "item_item", "semantic", "seq2seq", "llm"
     agent_type: str = "associative"
+    agent_types: list[str] = field(default_factory=list)
+    agent_type_proportions: list[float] = field(default_factory=list)
+    agent_assignment_mode: str = "one_to_one"
 
     # ── Action model ───────────────────────────────────────────────────────
     # Implicit signal strength for "watch" and "add_to_list" actions.
@@ -84,25 +98,143 @@ class SimConfig:
     # e.g. {"casual": 0.6, "binger": 0.4}
     archetype_mix: dict = field(default_factory=lambda: {"casual": .7, "binger": .2, "critic": .1 })
 
+    # ── LLM agent ──────────────────────────────────────────────────────────
+    # mlx-lm model ID from HuggingFace (mlx-community namespace).
+    llm_model_id: str = "mlx-community/Qwen2.5-7B-Instruct-4bit"
+    # Number of past rated items to include as history context.
+    llm_history_k: int = 2
+    # "top_rated"  — top-k by explicit rating
+    # "recent"     — top-k by timestamp
+    # "both"       — top-k by rating + top-k by timestamp (deduplicated)
+    # "polarized"  — top-k highest-rated + top-k lowest-rated
+    llm_history_strategy: str = "top_rated"
+    # Max new tokens for LLM generation per item.
+    llm_max_tokens: int = 64
+    # Truncation limit for movie overviews in the prompt.
+    llm_overview_max_chars: int = 300
+    # Whether to prepend fixed few-shot examples to anchor output format.
+    llm_use_few_shot: bool = True
+
     def as_dict(self) -> dict:
         """Return a flat dict of all parameters (for MLflow logging)."""
         return {
             "data_dir": str(self.data_dir),
             "embeddings_dir": str(self.embeddings_dir),
             "eval_user_frac": self.eval_user_frac,
+            "validation_frac": self.validation_frac,
             "holdout_frac": self.holdout_frac,
             "min_ratings": self.min_ratings,
             "experiment_profile": self.experiment_profile,
+            "recommender_eval_split": self.recommender_eval_split,
             "num_rounds": self.num_rounds,
             "rec_list_size": self.rec_list_size,
             "accept_k": self.accept_k,
             "max_requests_per_round": self.max_requests_per_round,
             "mf_features": self.mf_features,
+            "mf_epochs": self.mf_epochs,
+            "mf_regularization": self.mf_regularization,
+            "mf_damping": self.mf_damping,
             "user_pref_features": self.user_pref_features,
             "semantic_model": self.semantic_model,
             "random_seed": self.random_seed,
             "agent_type": self.agent_type,
+            "agent_types": str(self.agent_types),
+            "agent_type_proportions": str(self.agent_type_proportions),
+            "agent_assignment_mode": self.agent_assignment_mode,
             "watch_signal": self.watch_signal,
             "add_to_list_signal": self.add_to_list_signal,
             "archetype_mix": str(self.archetype_mix),
+            "llm_model_id": self.llm_model_id,
+            "llm_history_k": self.llm_history_k,
+            "llm_history_strategy": self.llm_history_strategy,
+            "llm_max_tokens": self.llm_max_tokens,
+            "llm_overview_max_chars": self.llm_overview_max_chars,
+            "llm_use_few_shot": self.llm_use_few_shot,
         }
+
+    def to_json_dict(self) -> dict:
+        """Return a JSON-serializable representation of the config."""
+        payload: dict[str, object] = {}
+        for cfg_field in fields(self):
+            value = getattr(self, cfg_field.name)
+            if isinstance(value, Path):
+                payload[cfg_field.name] = str(value)
+            else:
+                payload[cfg_field.name] = value
+        return payload
+
+    @classmethod
+    def from_dict(cls, payload: dict) -> "SimConfig":
+        """Construct a config from a plain dict."""
+        valid_fields = {cfg_field.name for cfg_field in fields(cls)}
+        unknown = sorted(set(payload) - valid_fields)
+        if unknown:
+            raise ValueError(f"Unknown SimConfig fields: {unknown}")
+
+        kwargs = dict(payload)
+        for path_field in ("data_dir", "embeddings_dir"):
+            if path_field in kwargs:
+                kwargs[path_field] = Path(kwargs[path_field])
+        return cls(**kwargs)
+
+    @classmethod
+    def from_json_file(cls, path: Path) -> "SimConfig":
+        """Load a config from a JSON file."""
+        return cls.from_dict(json.loads(path.read_text()))
+
+    def platform_mf_kwargs(self) -> dict[str, int | float]:
+        """Return LensKit BiasedMF configuration in one shared place."""
+        return {
+            "features": self.mf_features,
+            "epochs": self.mf_epochs,
+            "regularization": self.mf_regularization,
+            "damping": self.mf_damping,
+        }
+
+    def split_cache_key(self) -> str:
+        """Return a stable cache key for data-split-defining parameters."""
+        return self._cache_key(
+            {
+                "data_dir": str(self.data_dir),
+                "eval_user_frac": self.eval_user_frac,
+                "validation_frac": self.validation_frac,
+                "holdout_frac": self.holdout_frac,
+                "min_ratings": self.min_ratings,
+                "random_seed": self.random_seed,
+            }
+        )
+
+    def platform_factor_cache_key(self) -> str:
+        """Return a cache key for platform MF artifacts."""
+        return self._cache_key(
+            {
+                "split": self.split_cache_key(),
+                "mf_features": self.mf_features,
+                "mf_epochs": self.mf_epochs,
+                "mf_regularization": self.mf_regularization,
+                "mf_damping": self.mf_damping,
+            }
+        )
+
+    def user_pref_cache_key(self) -> str:
+        """Return a cache key for the user-preference factor space."""
+        return self._cache_key(
+            {
+                "split": self.split_cache_key(),
+                "user_pref_features": self.user_pref_features,
+            }
+        )
+
+    def semantic_cache_key(self) -> str:
+        """Return a cache key for semantic embeddings."""
+        return self._cache_key(
+            {
+                "data_dir": str(self.data_dir),
+                "semantic_model": self.semantic_model,
+            }
+        )
+
+    @staticmethod
+    def _cache_key(payload: dict) -> str:
+        raw = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]

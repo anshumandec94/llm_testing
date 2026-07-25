@@ -22,6 +22,7 @@ import chromadb
 import numpy as np
 import pandas as pd
 from lenskit.als import BiasedMFScorer
+from lenskit.basic.bias import BiasModel
 from lenskit.data import from_interactions_df
 from lenskit.pipeline import topn_pipeline
 from sentence_transformers import SentenceTransformer
@@ -89,11 +90,27 @@ class Environment:
             rating_col="rating",
             timestamp_col="timestamp",
         )
+        self._setup_rating_bias_model()
 
         # ── ChromaDB client ────────────────────────────────────────────────
         db_path = Path(config.embeddings_dir)
         db_path.mkdir(parents=True, exist_ok=True)
         self.chroma_client = chromadb.PersistentClient(path=str(db_path))
+        self._assoc_collection_name = (
+            f"{COLLECTION_ASSOC}__{self.config.platform_factor_cache_key()}"
+        )
+        self._semantic_collection_name = (
+            f"{COLLECTION_SEMANTIC}__{self.config.semantic_cache_key()}"
+        )
+        self._user_pref_collection_name = (
+            f"{COLLECTION_USER_PREF}__{self.config.user_pref_cache_key()}"
+        )
+        self._user_factor_path = (
+            db_path / f"user_factors__{self.config.platform_factor_cache_key()}.npz"
+        )
+        self._user_pref_factor_path = (
+            db_path / f"user_pref_factors__{self.config.user_pref_cache_key()}.npz"
+        )
 
         # ── Build / load embedding collections ────────────────────────────
         self._setup_associative_embeddings()
@@ -146,6 +163,7 @@ class Environment:
         )
 
         # ── Per-user hold-out: keep most-recent holdout_frac ratings ──────
+        validation_rows: list[pd.DataFrame] = []
         held_out_rows: list[pd.DataFrame] = []
         train_rows: list[pd.DataFrame] = []
 
@@ -159,19 +177,37 @@ class Environment:
                 "timestamp", ascending=False
             )
             n_hold = max(1, int(len(user_df) * cfg.holdout_frac))
+            n_validation = 0
+            if cfg.validation_frac > 0:
+                n_validation = max(1, int(len(user_df) * cfg.validation_frac))
+
+            max_reserved = max(1, len(user_df) - 1)
+            total_reserved = n_hold + n_validation
+            if total_reserved > max_reserved:
+                overflow = total_reserved - max_reserved
+                reduce_validation = min(overflow, n_validation)
+                n_validation -= reduce_validation
+                overflow -= reduce_validation
+                if overflow > 0:
+                    n_hold = max(1, n_hold - overflow)
+
             held_out_rows.append(user_df.iloc[:n_hold])
-            train_rows.append(user_df.iloc[n_hold:])
+            validation_rows.append(user_df.iloc[n_hold : n_hold + n_validation])
+            train_rows.append(user_df.iloc[n_hold + n_validation :])
 
         # Non-eval users: all ratings go to training
         non_eval_mask = ~ratings["userId"].isin(self.eval_users)
         train_rows.append(ratings[non_eval_mask])
 
-        self.held_out: pd.DataFrame = pd.concat(held_out_rows, ignore_index=True)
+        self.validation: pd.DataFrame = pd.concat(validation_rows, ignore_index=True)
+        self.final_held_out: pd.DataFrame = pd.concat(held_out_rows, ignore_index=True)
+        self.held_out: pd.DataFrame = self.final_held_out
         self.train_ratings: pd.DataFrame = pd.concat(train_rows, ignore_index=True)
 
         logger.info(
-            "Split: %d train ratings, %d held-out ratings",
+            "Split: %d train ratings, %d validation ratings, %d held-out ratings",
             len(self.train_ratings),
+            len(self.validation),
             len(self.held_out),
         )
 
@@ -181,6 +217,27 @@ class Environment:
             return col.count() > 0
         except Exception:
             return False
+
+    def _setup_rating_bias_model(self) -> None:
+        """Learn train-set user/item biases for held-out residual diagnostics."""
+        bias_model = BiasModel.learn(self.dataset, damping=self.config.mf_damping)
+        self._rating_global_bias = float(bias_model.global_bias)
+        self._rating_user_biases = (
+            {
+                int(uid): float(bias_model.user_biases[i])
+                for i, uid in enumerate(bias_model.users.ids())
+            }
+            if bias_model.users is not None and bias_model.user_biases is not None
+            else {}
+        )
+        self._rating_item_biases = (
+            {
+                int(mid): float(bias_model.item_biases[i])
+                for i, mid in enumerate(bias_model.items.ids())
+            }
+            if bias_model.items is not None and bias_model.item_biases is not None
+            else {}
+        )
 
     def _setup_associative_embeddings(self) -> None:
         """
@@ -192,21 +249,25 @@ class Environment:
         """
         force = self.config.force_rebuild_embeddings
 
-        if not force and self._collection_exists_with_data(COLLECTION_ASSOC):
+        if not force and self._collection_exists_with_data(self._assoc_collection_name):
             logger.info(
                 "ChromaDB collection '%s' already exists – skipping rebuild.",
-                COLLECTION_ASSOC,
+                self._assoc_collection_name,
             )
-            self._assoc_collection = self.chroma_client.get_collection(COLLECTION_ASSOC)
+            self._assoc_collection = self.chroma_client.get_collection(
+                self._assoc_collection_name
+            )
             # Load the stored user factors from metadata
             self._load_user_factors_from_chroma()
             return
 
         logger.info(
-            "Training BiasedMF (features=%d) for associative embeddings …",
+            "Training BiasedMF (features=%d, epochs=%d, regularization=%.4f) for associative embeddings …",
             self.config.mf_features,
+            self.config.mf_epochs,
+            self.config.mf_regularization,
         )
-        scorer = BiasedMFScorer(features=self.config.mf_features)
+        scorer = BiasedMFScorer(**self.config.platform_mf_kwargs())
         pipe = topn_pipeline(scorer)
         pipe.train(self.dataset)
 
@@ -222,12 +283,12 @@ class Environment:
         # Store item factors in ChromaDB
         if force:
             try:
-                self.chroma_client.delete_collection(COLLECTION_ASSOC)
+                self.chroma_client.delete_collection(self._assoc_collection_name)
             except Exception:
                 pass
 
         col = self.chroma_client.get_or_create_collection(
-            COLLECTION_ASSOC,
+            self._assoc_collection_name,
             metadata={"description": "BiasedMF item latent factors"},
         )
 
@@ -253,9 +314,8 @@ class Environment:
 
         # Also persist user factors as a npz for reuse
         if self._user_factors:
-            factors_path = Path(self.config.embeddings_dir) / "user_factors.npz"
             np.savez(
-                factors_path,
+                self._user_factor_path,
                 user_ids=np.array(list(self._user_factors.keys())),
                 vectors=np.array(list(self._user_factors.values())),
             )
@@ -263,9 +323,8 @@ class Environment:
 
     def _load_user_factors_from_chroma(self) -> None:
         """Load user factors from the persisted npz file if available."""
-        factors_path = Path(self.config.embeddings_dir) / "user_factors.npz"
-        if factors_path.exists():
-            data = np.load(factors_path)
+        if self._user_factor_path.exists():
+            data = np.load(self._user_factor_path)
             self._user_factors = {
                 int(uid): vec
                 for uid, vec in zip(data["user_ids"], data["vectors"])
@@ -287,13 +346,13 @@ class Environment:
         """
         force = self.config.force_rebuild_embeddings
 
-        if not force and self._collection_exists_with_data(COLLECTION_SEMANTIC):
+        if not force and self._collection_exists_with_data(self._semantic_collection_name):
             logger.info(
                 "ChromaDB collection '%s' already exists – skipping rebuild.",
-                COLLECTION_SEMANTIC,
+                self._semantic_collection_name,
             )
             self._semantic_collection = self.chroma_client.get_collection(
-                COLLECTION_SEMANTIC
+                self._semantic_collection_name
             )
             return
 
@@ -317,12 +376,12 @@ class Environment:
 
         if force:
             try:
-                self.chroma_client.delete_collection(COLLECTION_SEMANTIC)
+                self.chroma_client.delete_collection(self._semantic_collection_name)
             except Exception:
                 pass
 
         col = self.chroma_client.get_or_create_collection(
-            COLLECTION_SEMANTIC,
+            self._semantic_collection_name,
             metadata={"description": "Sentence-transformer movie content embeddings"},
         )
         _chroma_upsert_batched(
@@ -348,19 +407,19 @@ class Environment:
         Both item and user vectors are L2-normalised before storage.
         """
         force = self.config.force_rebuild_embeddings
-        npz_path = Path(self.config.embeddings_dir) / "user_pref_factors.npz"
+        npz_path = self._user_pref_factor_path
 
         if (
             not force
-            and self._collection_exists_with_data(COLLECTION_USER_PREF)
+            and self._collection_exists_with_data(self._user_pref_collection_name)
             and npz_path.exists()
         ):
             logger.info(
                 "ChromaDB collection '%s' already exists – skipping rebuild.",
-                COLLECTION_USER_PREF,
+                self._user_pref_collection_name,
             )
             self._user_pref_collection = self.chroma_client.get_collection(
-                COLLECTION_USER_PREF
+                self._user_pref_collection_name
             )
             self._load_user_pref_factors_from_disk(npz_path)
             return
@@ -413,12 +472,12 @@ class Environment:
         # Store item factors in ChromaDB
         if force:
             try:
-                self.chroma_client.delete_collection(COLLECTION_USER_PREF)
+                self.chroma_client.delete_collection(self._user_pref_collection_name)
             except Exception:
                 pass
 
         col = self.chroma_client.get_or_create_collection(
-            COLLECTION_USER_PREF,
+            self._user_pref_collection_name,
             metadata={"description": "TruncatedSVD item factors (user pref space)"},
         )
         ids = [str(int(mid)) for mid in item_ids_unique]
@@ -526,6 +585,47 @@ class Environment:
             return fallback / norm if norm > 0 else fallback
         return None
 
-    def held_out_for_user(self, user_id: int) -> pd.DataFrame:
-        """Return the held-out rows for a specific user."""
-        return self.held_out[self.held_out["userId"] == user_id]
+    @property
+    def assoc_collection_name(self) -> str:
+        return self._assoc_collection_name
+
+    @property
+    def semantic_collection_name(self) -> str:
+        return self._semantic_collection_name
+
+    @property
+    def user_pref_collection_name(self) -> str:
+        return self._user_pref_collection_name
+
+    @property
+    def user_factor_cache_path(self) -> Path:
+        return self._user_factor_path
+
+    @property
+    def user_pref_factor_cache_path(self) -> Path:
+        return self._user_pref_factor_path
+
+    def split_frame(self, split: str) -> pd.DataFrame:
+        """Return the rows for a named evaluation split."""
+        if split == "validation":
+            return self.validation
+        if split == "held_out":
+            return self.held_out
+        raise ValueError(f"Unknown split: {split!r}")
+
+    def held_out_for_user(self, user_id: int, split: str = "held_out") -> pd.DataFrame:
+        """Return evaluation rows for a specific user and split."""
+        frame = self.split_frame(split)
+        return frame[frame["userId"] == user_id]
+
+    def get_rating_bias(self, user_id: int, movie_id: int) -> float:
+        """Return the train-set bias baseline for a user/movie pair."""
+        return (
+            self._rating_global_bias
+            + self._rating_user_biases.get(user_id, 0.0)
+            + self._rating_item_biases.get(movie_id, 0.0)
+        )
+
+    def debias_rating(self, user_id: int, movie_id: int, rating: float) -> float:
+        """Return an observed rating with the train-set bias baseline removed."""
+        return float(rating - self.get_rating_bias(user_id, movie_id))

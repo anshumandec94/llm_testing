@@ -16,6 +16,7 @@ All methods clamp the returned budget to [0.0, 1.0].
 """
 from __future__ import annotations
 
+import math
 from abc import ABC, abstractmethod
 
 
@@ -151,8 +152,6 @@ class ExponentialDecayAttention(AttentionStrategy):
         recovery_rate: float = 0.5,
         sat_threshold: float = 3.5,
     ) -> None:
-        import math
-        self._math = math
         self.decay_rate = decay_rate
         self.recovery = recovery
         self.recovery_rate = recovery_rate
@@ -164,7 +163,7 @@ class ExponentialDecayAttention(AttentionStrategy):
         return max(1, round(current_budget * list_size))
 
     def deplete(self, list_size: int, current_budget: float) -> float:
-        new_budget = current_budget * self._math.exp(-self.decay_rate * list_size)
+        new_budget = current_budget * math.exp(-self.decay_rate * list_size)
         return float(max(0.0, min(1.0, new_budget)))
 
     def restore(self, end_budget: float, satisfaction_signal: float) -> float:
