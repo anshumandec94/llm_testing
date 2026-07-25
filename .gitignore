@@ -18,3 +18,10 @@ data/
 mlruns/
 mlartifacts/
 embeddings/
+mlflow.db
+logs/
+.lavish/
+.opencode/
+reports/.Rhistory
+reports/*.png
+reports/latest_*
