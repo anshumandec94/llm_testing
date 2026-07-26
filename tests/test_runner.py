@@ -27,45 +27,54 @@ class TestRecommenderOnlyProfile:
         assert len(summary) == 1
         expected_summary_cols = {
             "round",
-            "user_count",
-            "hit_rate",
-            f"ndcg_at_{cfg.rec_list_size}",
-            "fraction_users_with_holdout_hit",
-            "mean_user_recommended_popularity_mean",
-            "mean_user_recommended_popularity_std",
-            "mean_user_heldout_popularity_mean",
-            "mean_user_heldout_popularity_std",
-            "mean_user_comparison_popularity_mean",
-            "mean_user_comparison_popularity_std",
-            "mean_user_heldout_debiased_rating_mean",
-            "mean_user_heldout_debiased_rating_std",
-            "mean_user_popularity_mean_delta",
-            "std_user_popularity_mean_delta",
-            "mean_user_heldout_recommender_score_mean",
-            "mean_user_heldout_recommender_score_std",
-            "mean_user_heldout_internal_score_mean",
-            "mean_user_heldout_internal_score_std",
-            "mean_user_heldout_recommender_residual_pearson",
-            "mean_user_heldout_recommender_residual_spearman",
-            "mean_user_heldout_internal_residual_pearson",
-            "mean_user_heldout_internal_residual_spearman",
-            "mean_user_heldout_score_mean_gap",
-            "std_user_heldout_score_mean_gap",
-            "fraction_users_recommender_score_mean_gt_internal",
-            "fraction_users_recommender_residual_pearson_gt_internal",
-            "global_heldout_recommender_residual_pearson",
-            "global_heldout_recommender_residual_spearman",
-            "global_heldout_internal_residual_pearson",
-            "global_heldout_internal_residual_spearman",
-            "fraction_users_recommended_mean_gt_comparison_mean",
+            "meta/user_count",
+            "ranking/hit_rate",
+            f"ranking/ndcg_at_{cfg.rec_list_size}",
+            "ranking/frac_users_with_hit",
+            "popularity/rec_mean",
+            "popularity/rec_std",
+            "popularity/heldout_mean",
+            "popularity/heldout_std",
+            "popularity/delta_mean",
+            "popularity/delta_std",
+            "popularity/frac_rec_gt_heldout",
+            "rating/heldout_mean",
+            "rating/heldout_std",
+            "score/rec_mean",
+            "score/rec_std",
+            "score/int_mean",
+            "score/int_std",
+            "score/gap_mean",
+            "score/gap_std",
+            "score/frac_rec_gt_int",
+            "correlation/rec_pearson",
+            "correlation/rec_spearman",
+            "correlation/int_pearson",
+            "correlation/int_spearman",
+            "correlation/frac_rec_pearson_gt_int",
+            "correlation/global_rec_pearson",
+            "correlation/global_rec_spearman",
+            "correlation/global_int_pearson",
+            "correlation/global_int_spearman",
+            # Selection metrics that sim.hpo and configs/hpo*.json depend on.
+            "error/rec_mse",
+            "error/rec_rmse",
+            "error/rec_mae",
+            "error/int_mse",
+            "error/int_rmse",
+            "error/int_mae",
+            "error/global_rec_rmse",
+            "error/global_rec_mae",
+            "error/global_int_rmse",
+            "error/global_int_mae",
         }
         assert expected_summary_cols.issubset(summary.columns)
 
         row = summary.iloc[0]
         assert row["round"] == 1
-        assert row["user_count"] > 0
-        assert 0.0 <= row["fraction_users_with_holdout_hit"] <= 1.0
-        assert 0.0 <= row["fraction_users_recommended_mean_gt_comparison_mean"] <= 1.0
+        assert row["meta/user_count"] > 0
+        assert 0.0 <= row["ranking/frac_users_with_hit"] <= 1.0
+        assert 0.0 <= row["popularity/frac_rec_gt_heldout"] <= 1.0
 
         user_diag_path = tmp_path / "mlartifacts" / "recommender_only_user_diagnostics.parquet"
         recs_path = tmp_path / "mlartifacts" / "recommender_only_recommendations.parquet"
@@ -107,7 +116,7 @@ class TestRecommenderOnlyProfile:
             "heldout_score_mean_gap",
         }
         assert required_user_cols.issubset(user_df.columns)
-        assert len(user_df) == int(row["user_count"])
+        assert len(user_df) == int(row["meta/user_count"])
         assert np.allclose(
             user_df["heldout_popularity_mean"], user_df["comparison_popularity_mean"]
         )
@@ -120,15 +129,15 @@ class TestRecommenderOnlyProfile:
             user_df["heldout_recommender_score_mean"] - user_df["heldout_internal_score_mean"],
         )
         assert np.isclose(
-            row["mean_user_popularity_mean_delta"],
+            row["popularity/delta_mean"],
             user_df["popularity_mean_delta"].mean(),
         )
         assert np.isclose(
-            row["mean_user_heldout_score_mean_gap"],
+            row["score/gap_mean"],
             user_df["heldout_score_mean_gap"].mean(),
         )
         assert np.isclose(
-            row["mean_user_heldout_debiased_rating_mean"],
+            row["rating/heldout_mean"],
             user_df["heldout_debiased_rating_mean"].mean(),
         )
 
@@ -163,7 +172,7 @@ class TestRecommenderOnlyProfile:
             )
             summary = SimulationRunner(cfg).run()
             assert len(summary) == 1
-            assert summary.iloc[0]["user_count"] > 0
+            assert summary.iloc[0]["meta/user_count"] > 0
 
     def test_recommender_only_supports_replicated_agent_comparisons(
         self, tiny_config, tmp_path, monkeypatch, env
@@ -182,7 +191,7 @@ class TestRecommenderOnlyProfile:
         summary = SimulationRunner(cfg).run()
 
         assert len(summary) == 1
-        assert summary.iloc[0]["user_count"] == len(env.eval_users) * 2
+        assert summary.iloc[0]["meta/user_count"] == len(env.eval_users) * 2
 
         user_df = pd.read_parquet(
             tmp_path / "mlartifacts" / "recommender_only_user_diagnostics.parquet"

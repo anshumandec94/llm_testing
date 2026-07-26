@@ -67,8 +67,10 @@ class HPOConfig:
         return self.experiment_name or f"{self.base_config.experiment_name}-hpo"
 
     def resolved_selection_metric(self, config: SimConfig) -> str:
+        # The shorthand expands to a namespaced summary column, matching the
+        # keys SimulationRunner emits for the recommender_only profile.
         if self.selection_metric == "ndcg_at_k":
-            return f"ndcg_at_{config.rec_list_size}"
+            return f"ranking/ndcg_at_{config.rec_list_size}"
         return self.selection_metric
 
 

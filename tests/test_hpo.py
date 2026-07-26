@@ -4,6 +4,7 @@ import json
 from dataclasses import replace
 
 from sim.hpo import HPOConfig, run_hpo
+from sim.runner import SimulationRunner
 
 
 class TestHPOConfig:
@@ -32,6 +33,32 @@ class TestHPOConfig:
         assert loaded.base_config.data_dir == base.data_dir
         assert loaded.base_config.embeddings_dir == base.embeddings_dir
         assert loaded.candidate_overrides[0]["mf_features"] == 4
+
+    def test_ndcg_shorthand_resolves_to_a_real_summary_column(
+        self, tiny_config, env, tmp_path, monkeypatch
+    ):
+        # run_hpo indexes candidate summaries by the resolved selection metric,
+        # so the shorthand must expand to a column SimulationRunner emits.
+        cfg = replace(
+            tiny_config,
+            experiment_profile="recommender_only",
+            mlflow_tracking_uri=str(tmp_path / "mlruns"),
+            experiment_name="test-hpo-ndcg-shorthand",
+            force_rebuild_embeddings=False,
+        )
+        hpo_config = HPOConfig(
+            base_config=cfg,
+            candidate_overrides=[{}],
+            selection_metric="ndcg_at_k",
+            minimize_selection_metric=False,
+        )
+        monkeypatch.chdir(tmp_path)
+
+        metric_name = hpo_config.resolved_selection_metric(cfg)
+
+        assert metric_name == f"ranking/ndcg_at_{cfg.rec_list_size}"
+        summary = SimulationRunner(cfg).run()
+        assert metric_name in summary.columns
 
 
 class TestRunHPO:
