@@ -7,9 +7,12 @@ tracking (mark_sent / advance_round), and the re-request mechanism.
 from __future__ import annotations
 
 import numpy as np
+import pandas as pd
 import pytest
 
 from lenskit.data import ItemList
+
+from sim.recommender import Recommender
 
 
 class TestRecommendBasic:
@@ -129,3 +132,37 @@ class TestFeedbackAndRetrain:
 
         assert accepted_ids.issubset(recommender._all_seen[uid])
         recommender.advance_round()
+
+
+class TestExpandedTrainRatings:
+    """
+    `_build_expanded_train_ratings` returns the Environment's frame directly
+    when no replication is needed, so it must never be mutated in place.
+    """
+
+    def test_does_not_mutate_environment_train_ratings(self, tiny_config, env):
+        """Replication must not write back into the shared training frame."""
+        before = env.train_ratings.copy(deep=True)
+        base_uid = int(env.train_ratings["userId"].iloc[0])
+        Recommender(tiny_config, env, user_base_map={-12345: base_uid})
+        pd.testing.assert_frame_equal(env.train_ratings, before)
+
+    def test_no_replication_does_not_duplicate_rows(self, tiny_config, env):
+        """An empty base map must yield exactly the training ratings."""
+        rec = Recommender(tiny_config, env, user_base_map={})
+        assert len(rec._expanded_train_ratings) == len(env.train_ratings)
+
+    def test_replication_clones_base_user_rows(self, tiny_config, env):
+        """A replicated user gets a full copy of its base user's ratings."""
+        base_uid = int(env.train_ratings["userId"].iloc[0])
+        sim_uid = -12345
+        rec = Recommender(tiny_config, env, user_base_map={sim_uid: base_uid})
+        expanded = rec._expanded_train_ratings
+
+        n_base = int((env.train_ratings["userId"] == base_uid).sum())
+        n_sim = int((expanded["userId"] == sim_uid).sum())
+        assert n_sim == n_base, (
+            f"Replicated user {sim_uid} has {n_sim} rows, expected {n_base} "
+            f"cloned from base user {base_uid}."
+        )
+        assert len(expanded) == len(env.train_ratings) + n_base

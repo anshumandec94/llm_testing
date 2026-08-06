@@ -63,7 +63,8 @@ class Recommender:
     config:
         Experiment configuration.
     env:
-        Initialised Environment (provides ``dataset`` and movie metadata).
+        Initialised Environment (provides training ratings and movie metadata).
+        The Recommender builds and owns its own LensKit ``Dataset``.
     """
 
     def __init__(
@@ -104,17 +105,23 @@ class Recommender:
     # ──────────────────────────────────────────────────────────────────────
 
     def _build_expanded_train_ratings(self) -> pd.DataFrame:
-        """Return train ratings with replicated simulated users cloned from base users."""
-        train = self.env.train_ratings[["userId", "movieId", "rating", "timestamp"]].copy()
+        """
+        Return train ratings with replicated simulated users cloned from base users.
+
+        The result is only ever read (grouped, concatenated, trained on), never
+        mutated in place, so when no replication is required this returns the
+        Environment's training ratings directly instead of duplicating them.
+        That duplicate costs ~0.9 GB on ML-32M.
+        """
+        train = self.env.train_ratings[["userId", "movieId", "rating", "timestamp"]]
         extra_rows: list[pd.DataFrame] = []
         for sim_user_id, base_user_id in self._user_base_map.items():
             if sim_user_id == base_user_id:
                 continue
-            base_rows = train[train["userId"] == base_user_id].copy()
+            base_rows = train[train["userId"] == base_user_id]
             if base_rows.empty:
                 continue
-            base_rows["userId"] = sim_user_id
-            extra_rows.append(base_rows)
+            extra_rows.append(base_rows.assign(userId=sim_user_id))
 
         if extra_rows:
             train = pd.concat([train, *extra_rows], ignore_index=True)

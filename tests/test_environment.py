@@ -197,3 +197,29 @@ class TestUserPrefEmbeddings:
             assert abs(norm - 1.0) < 1e-5, (
                 f"Item {mid} user-pref factor has norm {norm:.4f}, expected ~1.0"
             )
+
+
+class TestDatasetLifecycle:
+    """The LensKit Dataset is released after construction to cap peak memory."""
+
+    def test_dataset_is_released_after_construction(self, env):
+        """Holding the Dataset for the whole run duplicates ~1 GB on ML-32M."""
+        assert env._dataset is None, (
+            "Environment retained its LensKit Dataset after __init__; it is only "
+            "needed for the bias model and associative embeddings."
+        )
+
+    def test_dataset_property_rebuilds_on_access(self, env):
+        """Accessing `dataset` after release must still yield a usable Dataset."""
+        rebuilt = env.dataset
+        assert rebuilt is not None
+        assert rebuilt.interaction_count == len(env.train_ratings)
+        # Reset so the released-state invariant holds for other tests.
+        env._dataset = None
+
+    def test_rebuilt_dataset_matches_training_ratings(self, env):
+        """The rebuilt Dataset must cover the same users and items as training."""
+        rebuilt = env.dataset
+        assert set(rebuilt.users.ids()) == set(env.train_ratings["userId"].unique())
+        assert set(rebuilt.items.ids()) == set(env.train_ratings["movieId"].unique())
+        env._dataset = None

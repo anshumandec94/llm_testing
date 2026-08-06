@@ -23,7 +23,7 @@ import numpy as np
 import pandas as pd
 from lenskit.als import BiasedMFScorer
 from lenskit.basic.bias import BiasModel
-from lenskit.data import from_interactions_df
+from lenskit.data import Dataset, from_interactions_df
 from lenskit.pipeline import topn_pipeline
 from sentence_transformers import SentenceTransformer
 from sklearn.decomposition import TruncatedSVD
@@ -83,13 +83,7 @@ class Environment:
 
         # ── Build LensKit Dataset from training ratings ─────────────────────
         logger.info("Building LensKit Dataset …")
-        self.dataset = from_interactions_df(
-            self.train_ratings[["userId", "movieId", "rating", "timestamp"]].copy(),
-            user_col="userId",
-            item_col="movieId",
-            rating_col="rating",
-            timestamp_col="timestamp",
-        )
+        self._dataset: Dataset | None = self._build_dataset()
         self._setup_rating_bias_model()
 
         # ── ChromaDB client ────────────────────────────────────────────────
@@ -117,9 +111,41 @@ class Environment:
         self._setup_semantic_embeddings()
         self._setup_user_pref_embeddings()
 
+        # The Dataset is only needed for the bias model and the associative
+        # embeddings above. Holding it for the Environment's lifetime costs
+        # ~1 GB on ML-32M while the Recommender builds its own copy to train
+        # on, which is enough to OOM a 15 GB machine. Release it; the
+        # ``dataset`` property rebuilds on demand if anything still wants it.
+        self._dataset = None
+
+    @property
+    def dataset(self) -> Dataset:
+        """
+        LensKit ``Dataset`` over the training ratings.
+
+        Built during construction for the bias model and associative
+        embeddings, then released so it does not sit in memory alongside the
+        Recommender's own training dataset. Accessing it afterwards rebuilds
+        it, which is cheap relative to holding it for the whole run.
+        """
+        if self._dataset is None:
+            logger.info("Rebuilding LensKit Dataset from training ratings …")
+            self._dataset = self._build_dataset()
+        return self._dataset
+
     # ──────────────────────────────────────────────────────────────────────
     # Private helpers
     # ──────────────────────────────────────────────────────────────────────
+
+    def _build_dataset(self) -> Dataset:
+        """Construct the LensKit Dataset from the training ratings."""
+        return from_interactions_df(
+            self.train_ratings[["userId", "movieId", "rating", "timestamp"]],
+            user_col="userId",
+            item_col="movieId",
+            rating_col="rating",
+            timestamp_col="timestamp",
+        )
 
     def _load_data(self) -> None:
         data_dir = Path(self.config.data_dir)
@@ -431,7 +457,7 @@ class Environment:
 
         # Build a sparse rating matrix: rows=users, cols=items
         # Only use training ratings.
-        train = self.train_ratings[["userId", "movieId", "rating"]].copy()
+        train = self.train_ratings[["userId", "movieId", "rating"]]
 
         # Integer-encode users and items for the matrix
         user_ids_unique = np.sort(train["userId"].unique())
