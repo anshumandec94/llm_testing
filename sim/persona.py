@@ -17,11 +17,13 @@ each user.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from copy import deepcopy
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
 import numpy as np
 
+from sim.population import UserAssignment
 from sim.archetypes import ARCHETYPE_REGISTRY, ArchetypeConfig
 from sim.attention import ATTENTION_REGISTRY, AttentionStrategy
 from sim.attendance import ATTENDANCE_REGISTRY, AttendanceStrategy
@@ -180,8 +182,9 @@ class AgentPersona:
         if action == "add_to_list":
             return float(config.add_to_list_signal)
         # "rate": Beta-sampled signal in [1, 5]
-        alpha = max(0.1, score * config.beta_alpha_max)
-        beta = max(0.1, (1.0 - score) * config.beta_beta_max)
+        affinity = _sigmoid(score)
+        alpha = max(0.1, affinity * config.beta_alpha_max)
+        beta = max(0.1, (1.0 - affinity) * config.beta_beta_max)
         raw = float(rng.beta(alpha, beta))  # in [0, 1]
         return 1.0 + 4.0 * raw             # rescale to [1, 5]
 
@@ -196,14 +199,16 @@ class AgentPersona:
     ) -> None:
         """
         Update preference vector via a gradient step toward each acted-on
-        item's embedding, weighted by signal strength. Renormalises to unit
-        length after each update.
+        item's embedding, weighted by explicit debiased rating residual.
+        Renormalises to unit length after each update.
 
         Parameters
         ----------
         interactions:
             List of ``(movie_id, action, signal_strength)`` tuples. Only
-            acted-on items (action != "ignore") should be passed here.
+            explicit rating updates should be passed here. The signal is
+            interpreted as a signed residual, so positive values pull the
+            preference vector toward the item and negative values push away.
         item_factors:
             Dict mapping movieId → item vector in user-pref space.
         """
@@ -211,7 +216,7 @@ class AgentPersona:
             if movie_id not in item_factors:
                 continue
             item_vec = item_factors[movie_id]
-            # Normalise signal to [0, 1] for the update step
+            # Scale the signed residual into a stable update step.
             norm_signal = signal / 5.0
             self.pref_vector = self.pref_vector + self.lr * norm_signal * item_vec
 
@@ -354,6 +359,54 @@ def build_population(
 
     logger.info(
         "Built population of %d personas: %s",
+        len(population),
+        archetype_counts,
+    )
+    return population
+
+
+def build_population_for_assignments(
+    config: "SimConfig",
+    env: "Environment",
+    assignments: list[UserAssignment],
+    rng: np.random.Generator,
+) -> dict[int, AgentPersona]:
+    """Build personas keyed by simulated user ID for explicit assignments."""
+    mix = config.archetype_mix
+    names = list(mix.keys())
+    proportions = np.array([mix[n] for n in names], dtype=float)
+    proportions /= proportions.sum()
+
+    base_user_ids = sorted({assignment.base_user_id for assignment in assignments})
+    assigned_archetypes = rng.choice(names, size=len(base_user_ids), p=proportions)
+
+    base_personas: dict[int, AgentPersona] = {}
+    for base_user_id, arch_name in zip(base_user_ids, assigned_archetypes):
+        if arch_name in ARCHETYPE_REGISTRY:
+            arch_cfg = ARCHETYPE_REGISTRY[arch_name]
+        elif hasattr(config, "archetype_configs") and arch_name in config.archetype_configs:  # ty:ignore[unsupported-operator]
+            arch_cfg = config.archetype_configs[arch_name]  # ty:ignore[not-subscriptable]
+        else:
+            raise ValueError(
+                f"Archetype {arch_name!r} not found in ARCHETYPE_REGISTRY or "
+                f"config.archetype_configs."
+            )
+        base_personas[base_user_id] = build_persona(base_user_id, arch_cfg, env, rng)
+
+    population: dict[int, AgentPersona] = {}
+    archetype_counts: dict[str, int] = {}
+    for assignment in assignments:
+        base_persona = deepcopy(base_personas[assignment.base_user_id])
+        population[assignment.sim_user_id] = replace(
+            base_persona,
+            user_id=assignment.sim_user_id,
+        )
+        archetype_counts[base_persona.archetype] = (
+            archetype_counts.get(base_persona.archetype, 0) + 1
+        )
+
+    logger.info(
+        "Built assignment-aware population of %d personas: %s",
         len(population),
         archetype_counts,
     )

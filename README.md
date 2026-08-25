@@ -101,6 +101,20 @@ uv run python main.py
 uv run python main.py --experiment_profile recommender_only
 ```
 
+### Recommender HPO search
+
+```bash
+uv run python -m sim.hpo path/to/hpo-config.json
+```
+
+The HPO config is JSON and should include:
+
+- `base_config`: a normal `SimConfig` payload
+- `candidate_overrides`: a list of recommender-parameter override dicts
+
+The search runs candidates on the `validation` split using the existing
+`recommender_only` workflow, then reruns the selected best config on `held_out`.
+
 ### Force-rebuild embeddings
 
 ```bash
@@ -134,6 +148,7 @@ Read-later analyses live in `reports/`.
 ### Docs
 
 Planning documents and internal notes live in `docs/`.
+The metric reference lives in `docs/METRIC_DICTIONARY.md`.
 
 ## Where to look next
 
