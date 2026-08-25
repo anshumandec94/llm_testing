@@ -265,3 +265,103 @@ class TestEvaluatePipeline:
         metrics = _compute_metrics(all_predicted, all_actual)
         assert np.isfinite(metrics["error/mae"])
         assert np.isfinite(metrics["error/rmse"])
+
+
+# ── Matched item selection across arms ────────────────────────────────────────
+# Issue #2. The 2026-06-26 sweep scored the associative baseline on the full
+# held-out set and each LLM arm on the first 5 items per user, so the MAE gap
+# between them was a difference in evaluation set rather than in agent. These
+# tests guard the property that made that possible.
+
+
+class TestMatchedItemSelection:
+    """Both arms must select the same (user, item) pairs under the same cap."""
+
+    @pytest.fixture(scope="class")
+    def eval_context(self, tiny_config, env):
+        rng = np.random.default_rng(tiny_config.random_seed)
+        assignments = build_user_assignments(tiny_config, env, rng)
+        users, _ = SimulatedUser.build_population(tiny_config, env, rng, assignments=assignments)
+        return assignments, users
+
+    def test_select_held_items_caps_positionally(self, env, eval_context):
+        """A cap takes the leading N rows, preserving held-out order."""
+        from experiments.llm_vs_associative import select_held_items
+
+        assignments, _ = eval_context
+        base_uid = assignments[0].base_user_id
+        held_out_df = env.held_out_for_user(base_uid)
+
+        uncapped = select_held_items(held_out_df, None)
+        capped = select_held_items(held_out_df, 2)
+
+        assert len(uncapped) == len(held_out_df)
+        assert capped == uncapped[:2]
+
+    def test_select_held_items_uncapped_returns_everything(self, env, eval_context):
+        """max_items_per_user=None must not drop any held-out item."""
+        from experiments.llm_vs_associative import select_held_items
+
+        assignments, _ = eval_context
+        for assignment in assignments:
+            held_out_df = env.held_out_for_user(assignment.base_user_id)
+            assert len(select_held_items(held_out_df, None)) == len(held_out_df)
+
+    def test_cap_larger_than_history_is_a_no_op(self, env, eval_context):
+        """A cap above a user's held-out count must not pad or truncate."""
+        from experiments.llm_vs_associative import select_held_items
+
+        assignments, _ = eval_context
+        held_out_df = env.held_out_for_user(assignments[0].base_user_id)
+        assert select_held_items(held_out_df, 10_000) == select_held_items(held_out_df, None)
+
+    def test_associative_and_llm_arms_score_identical_pairs(self, tiny_config, env, eval_context):
+        """The regression that motivated issue #2.
+
+        The pairs an arm scores depend only on assignments, the held-out split
+        and the cap, so the LLM arm's selection can be reproduced without any
+        LLM call. Equal counts are not enough: the pairs themselves must match.
+        """
+        from experiments.llm_vs_associative import score_associative, select_held_items
+
+        assignments, users = eval_context
+        cap = 2
+
+        _, _, associative_pairs = score_associative(
+            env, assignments, users, max_items_per_user=cap,
+        )
+
+        llm_pairs: list[tuple[int, int]] = []
+        for assignment in assignments:
+            held_out_df = env.held_out_for_user(
+                assignment.base_user_id, split=tiny_config.recommender_eval_split,
+            )
+            if held_out_df.empty:
+                continue
+            for mid in select_held_items(held_out_df, cap):
+                llm_pairs.append((assignment.base_user_id, mid))
+
+        assert associative_pairs == llm_pairs
+        assert len(associative_pairs) > 0
+
+    def test_cap_reduces_the_scored_item_count(self, env, eval_context):
+        """A capped baseline must score strictly fewer items than an uncapped one.
+
+        Without this the cap could silently no-op and the comparison would look
+        matched while staying exactly as confounded as before.
+        """
+        from experiments.llm_vs_associative import score_associative
+
+        assignments, users = eval_context
+        _, _, uncapped = score_associative(env, assignments, users, max_items_per_user=None)
+        _, _, capped = score_associative(env, assignments, users, max_items_per_user=1)
+
+        assert len(capped) < len(uncapped)
+        assert len(capped) == len({uid for uid, _ in capped})
+
+    def test_capped_run_name_does_not_collide_with_the_uncapped_run(self):
+        """The 2026-06-26 uncapped baseline is kept, so names must differ."""
+        from experiments.llm_vs_associative import baseline_run_name
+
+        assert baseline_run_name(None) == "associative-baseline"
+        assert baseline_run_name(5) == "associative-baseline-capped"

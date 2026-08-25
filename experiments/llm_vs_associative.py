@@ -18,7 +18,13 @@ LLM prediction:
 
 Both predictions are in [1, 5] so MAE and RMSE are directly comparable.
 
+Both arms select the items they score through `select_held_items`, so a given
+`--max-items` produces the same (user, item) pairs on both sides. Each run logs
+those pairs as a `scored_pairs.csv` artifact, because equal `meta/item_count`
+is not the same thing as equal pairs.
+
 Usage:
+    uv run python experiments/llm_vs_associative.py --baseline-only --max-items 5
     uv run python experiments/llm_vs_associative.py
 
 View results:
@@ -31,11 +37,13 @@ Add or remove LLM variants by editing LLM_VARIANTS below.
 import argparse
 import logging
 import sys
+import tempfile
 import time
 from pathlib import Path
 
 import mlflow
 import numpy as np
+import pandas as pd
 from lenskit.data import ItemList
 from tqdm.auto import tqdm
 
@@ -114,8 +122,97 @@ def _compute_metrics(predicted: list[float], actual: list[float]) -> dict:
     }
 
 
-def evaluate_associative(env: Environment, assignments, users: dict, run_name: str) -> None:
-    """Evaluate AssociativeAgent: bias + dot-product per held-out item."""
+def select_held_items(held_out_df, max_items_per_user: int | None) -> list[int]:
+    """Choose which held-out items an arm scores for one user.
+
+    Every arm must go through this function. It is the only reason the
+    associative and LLM arms can be trusted to score the same (user, item)
+    pairs, and the 2026-06-26 sweep is what happens when they do not: the
+    LLM arms sliced to five items per user and the baseline did not, so the
+    MAE gap between them was a difference in evaluation set, not in agent.
+
+    The slice is positional, and held-out rows arrive sorted by timestamp
+    descending (`sim/environment.py`), so a cap selects each user's most
+    RECENT ratings rather than an arbitrary sample. That bias is measured
+    separately in issue #3; do not assume it is negligible.
+    """
+    held_ids = [int(mid) for mid in held_out_df["movieId"]]
+    if max_items_per_user is not None:
+        held_ids = held_ids[:max_items_per_user]
+    return held_ids
+
+
+def _log_scored_pairs(pairs: list[tuple[int, int]]) -> None:
+    """Log the exact (user, item) pairs an arm scored, as a run artifact.
+
+    Cross-arm MAE comparisons are only meaningful when these files match, so
+    the run carries the evidence rather than the reader having to trust a
+    matching `meta/item_count`. Equal counts are not equal pairs.
+    """
+    frame = pd.DataFrame({
+        "userId": [uid for uid, _ in pairs],
+        "movieId": [mid for _, mid in pairs],
+    })
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "scored_pairs.csv"
+        frame.to_csv(path, index=False)
+        mlflow.log_artifact(str(path))
+
+
+def score_associative(
+    env: Environment,
+    assignments,
+    users: dict,
+    max_items_per_user: int | None = None,
+) -> tuple[list[float], list[float], list[tuple[int, int]]]:
+    """Score every selected held-out item with bias + dot-product.
+
+    Pure computation, no MLflow, so tests can exercise the real code path.
+    Returns (predicted, actual, pairs).
+    """
+    cfg = BASE_CONFIG
+    all_predicted: list[float] = []
+    all_actual: list[float] = []
+    pairs: list[tuple[int, int]] = []
+
+    for assignment in assignments:
+        uid = assignment.sim_user_id
+        base_uid = assignment.base_user_id
+        held_out_df = env.held_out_for_user(base_uid, split=cfg.recommender_eval_split)
+        if held_out_df.empty:
+            continue
+
+        held_ids = select_held_items(held_out_df, max_items_per_user)
+        actual_by_id = {
+            int(mid): float(r)
+            for mid, r in zip(held_out_df["movieId"], held_out_df["rating"])
+        }
+        persona = users[uid].persona
+        item_factors = env.get_user_pref_item_factors(held_ids)
+
+        for mid in held_ids:
+            bias = env.get_rating_bias(base_uid, mid)
+            dot = float(np.dot(persona.pref_vector, item_factors[mid])) if mid in item_factors else 0.0
+            pred = float(np.clip(bias + dot, 1.0, 5.0))
+            all_predicted.append(pred)
+            all_actual.append(actual_by_id[mid])
+            pairs.append((base_uid, mid))
+
+    return all_predicted, all_actual, pairs
+
+
+def evaluate_associative(
+    env: Environment,
+    assignments,
+    users: dict,
+    run_name: str,
+    max_items_per_user: int | None = None,
+) -> None:
+    """Evaluate AssociativeAgent: bias + dot-product per held-out item.
+
+    max_items_per_user caps items per user exactly as `evaluate_llm` does, so
+    the two arms are comparable. Uncapped scores the full held-out set.
+    """
     cfg = BASE_CONFIG
     mlflow.set_tracking_uri(MLFLOW_URI)
     mlflow.set_experiment(EXPERIMENT_NAME)
@@ -123,44 +220,28 @@ def evaluate_associative(env: Environment, assignments, users: dict, run_name: s
     with mlflow.start_run(run_name=run_name):
         mlflow.log_params({
             "agent_type": "associative",
+            "max_items_per_user": max_items_per_user,
+            "item_selection": "first",
             "eval_user_frac": cfg.eval_user_frac,
             "random_seed": cfg.random_seed,
             "eval_split": cfg.recommender_eval_split,
         })
 
-        all_predicted: list[float] = []
-        all_actual: list[float] = []
-
-        for assignment in assignments:
-            uid = assignment.sim_user_id
-            base_uid = assignment.base_user_id
-            held_out_df = env.held_out_for_user(base_uid, split=cfg.recommender_eval_split)
-            if held_out_df.empty:
-                continue
-
-            held_ids = [int(mid) for mid in held_out_df["movieId"]]
-            actual_by_id = {
-                int(mid): float(r)
-                for mid, r in zip(held_out_df["movieId"], held_out_df["rating"])
-            }
-            persona = users[uid].persona
-            item_factors = env.get_user_pref_item_factors(held_ids)
-
-            for mid in held_ids:
-                bias = env.get_rating_bias(base_uid, mid)
-                dot = float(np.dot(persona.pref_vector, item_factors[mid])) if mid in item_factors else 0.0
-                pred = float(np.clip(bias + dot, 1.0, 5.0))
-                all_predicted.append(pred)
-                all_actual.append(actual_by_id[mid])
+        all_predicted, all_actual, pairs = score_associative(
+            env, assignments, users, max_items_per_user=max_items_per_user,
+        )
 
         metrics = _compute_metrics(all_predicted, all_actual)
         metrics["meta/user_count"] = float(len(assignments))
         metrics["meta/item_count"] = float(len(all_predicted))
         mlflow.log_metrics(metrics)
+        _log_scored_pairs(pairs)
         logger.info(
-            "associative  MAE=%.4f  RMSE=%.4f  score_mean=%.4f  score_std=%.4f",
+            "%s  MAE=%.4f  RMSE=%.4f  score_mean=%.4f  score_std=%.4f  items=%d",
+            run_name,
             metrics["error/mae"], metrics["error/rmse"],
             metrics["score/mean"], metrics["score/std"],
+            len(all_predicted),
         )
 
 
@@ -206,6 +287,8 @@ def evaluate_llm(
             "llm_history_k": history_k,
             "llm_use_few_shot": use_few_shot,
             "llm_max_items_per_user": max_items_per_user,
+            "max_items_per_user": max_items_per_user,
+            "item_selection": "first",
             "eval_user_frac": cfg.eval_user_frac,
             "random_seed": cfg.random_seed,
             "eval_split": cfg.recommender_eval_split,
@@ -213,6 +296,7 @@ def evaluate_llm(
 
         all_predicted: list[float] = []
         all_actual: list[float] = []
+        pairs: list[tuple[int, int]] = []
         first_call_logged = False
         t_start = time.time()
 
@@ -224,8 +308,9 @@ def evaluate_llm(
                 if held_out_df.empty:
                     continue
 
-                # Cap items per user to keep runtime predictable.
-                held_ids = [int(mid) for mid in held_out_df["movieId"]][:max_items_per_user]
+                # Cap items per user to keep runtime predictable. Shared with
+                # the associative arm so both score identical pairs.
+                held_ids = select_held_items(held_out_df, max_items_per_user)
                 actual_by_id = {
                     int(mid): float(r)
                     for mid, r in zip(held_out_df["movieId"], held_out_df["rating"])
@@ -273,6 +358,7 @@ def evaluate_llm(
                 for mid, score in zip([int(i) for i in scored.ids()], scores):
                     all_predicted.append(float(score))
                     all_actual.append(actual_by_id[mid])
+                    pairs.append((base_uid, mid))
 
                 # Update progress bar with live metrics.
                 elapsed = time.time() - t_start
@@ -296,6 +382,7 @@ def evaluate_llm(
         metrics["meta/user_count"] = float(len(assignments))
         metrics["meta/item_count"] = float(len(all_predicted))
         mlflow.log_metrics(metrics)
+        _log_scored_pairs(pairs)
         logger.info(
             "%s  MAE=%.4f  RMSE=%.4f  score_mean=%.4f  score_std=%.4f",
             run_name,
@@ -331,6 +418,15 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Run all LLM variants sequentially (slow).",
     )
+    group.add_argument(
+        "--baseline-only",
+        action="store_true",
+        help=(
+            "Score the associative baseline and no LLM variant. Costs one "
+            "environment build and no LLM calls, so it is the cheap way to "
+            "re-score the baseline against an already-completed LLM sweep."
+        ),
+    )
     parser.add_argument(
         "--max-items",
         type=int,
@@ -345,15 +441,26 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def baseline_run_name(max_items_per_user: int | None) -> str:
+    """Name the baseline run after its item cap.
+
+    The capped run must not collide with the uncapped `associative-baseline`
+    from 2026-06-26, which is kept so the two sit side by side in MLflow.
+    """
+    return "associative-baseline" if max_items_per_user is None else "associative-baseline-capped"
+
+
 def main() -> None:
     args = _parse_args()
 
     variants_to_run = (
         LLM_VARIANTS if args.all
+        else [] if args.baseline_only
         else [v for v in LLM_VARIANTS if v["run_name"] == args.variant]
     )
 
     max_items = args.max_items  # None = full held-out set
+    run_name = baseline_run_name(max_items)
 
     print(f"=== {EXPERIMENT_NAME} ===")
     print(f"  eval_user_frac: {BASE_CONFIG.eval_user_frac}  |  seed: {BASE_CONFIG.random_seed}")
@@ -362,8 +469,15 @@ def main() -> None:
 
     env, assignments, users = _setup()
 
-    print("[1] Associative baseline")
-    evaluate_associative(env, assignments, users, run_name="associative-baseline")
+    print(f"[1] Associative baseline → run '{run_name}'")
+    evaluate_associative(
+        env, assignments, users, run_name=run_name, max_items_per_user=max_items,
+    )
+
+    if not variants_to_run:
+        print("\nBaseline only, no LLM variants run.")
+        print(f"Done. View: uv run mlflow ui --backend-store-uri {MLFLOW_URI}")
+        return
 
     print(f"\n[2] LLM variant(s): {[v['run_name'] for v in variants_to_run]}")
     for i, variant in enumerate(variants_to_run, 1):
