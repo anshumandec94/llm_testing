@@ -55,7 +55,7 @@ Always use `uv` / `uv run`. Never bare `python` or `pip`.
 | `item_item.py` | Implemented - item-item neighborhood scoring |
 | `semantic.py` | Stub - raises `NotImplementedError` |
 | `seq2seq.py` | Stub - raises `NotImplementedError` |
-| `llm.py` | Stub - raises `NotImplementedError` |
+| `llm.py` | Implemented - local LLM rating prediction via `mlx-lm` |
 
 New agents must be registered in `AGENT_REGISTRY` in `sim/agents/__init__.py`.
 

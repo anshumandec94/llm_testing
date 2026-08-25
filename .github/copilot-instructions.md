@@ -18,7 +18,7 @@
 - `sim.user_agent.SimulatedUser` is the facade the runner talks to. It combines one shared scoring agent with one per-user `AgentPersona`, so the runner can treat "the user" as a single object even though scoring and behavior are separate concerns.
 - `sim.persona.AgentPersona` owns the mutable user-side state: preference vector, attention budget, attendance EWMA, and attendance counters. Attention and attendance behavior are delegated to strategy objects from `sim.attention` and `sim.attendance`.
 - `sim.runner.SimulationRunner` orchestrates the full loop: attendance gate -> recommendation request loop -> agent scoring -> persona action sampling -> recommender feedback update -> persona update -> per-round metrics and MLflow artifacts.
-- Only `sim.agents.associative.AssociativeAgent` is implemented today. `semantic.py`, `seq2seq.py`, and `llm.py` are still explicit stubs that raise `NotImplementedError`.
+- `associative.py`, `residual_profile.py`, `item_item.py`, and `llm.py` are implemented today. `semantic.py` and `seq2seq.py` are still explicit stubs that raise `NotImplementedError`.
 
 ## Key conventions
 
