@@ -122,7 +122,13 @@ def _compute_metrics(predicted: list[float], actual: list[float]) -> dict:
     }
 
 
-def select_held_items(held_out_df, max_items_per_user: int | None) -> list[int]:
+def select_held_items(
+    held_out_df,
+    max_items_per_user: int | None,
+    selection: str = "first",
+    user_id: int | None = None,
+    seed: int | None = None,
+) -> list[int]:
     """Choose which held-out items an arm scores for one user.
 
     Every arm must go through this function. It is the only reason the
@@ -131,15 +137,32 @@ def select_held_items(held_out_df, max_items_per_user: int | None) -> list[int]:
     LLM arms sliced to five items per user and the baseline did not, so the
     MAE gap between them was a difference in evaluation set, not in agent.
 
-    The slice is positional, and held-out rows arrive sorted by timestamp
-    descending (`sim/environment.py`), so a cap selects each user's most
-    RECENT ratings rather than an arbitrary sample. That bias is measured
-    separately in issue #3; do not assume it is negligible.
+    Two selections:
+
+    "first"  - a positional head. Held-out rows arrive sorted by timestamp
+               descending (`sim/environment.py`), so this takes each user's
+               most RECENT ratings, not an arbitrary sample. It is the
+               default because the 2026-06-26 runs used it and changing the
+               default would silently break comparability with them.
+    "random" - a uniform sample without replacement, seeded per user from
+               (seed, user_id) so it is deterministic and independent of the
+               order users happen to be iterated in.
+
+    Sampled ids are returned in held-out order rather than draw order, so the
+    two selections differ only in which items are chosen.
     """
     held_ids = [int(mid) for mid in held_out_df["movieId"]]
-    if max_items_per_user is not None:
-        held_ids = held_ids[:max_items_per_user]
-    return held_ids
+    if max_items_per_user is None or len(held_ids) <= max_items_per_user:
+        return held_ids
+    if selection == "first":
+        return held_ids[:max_items_per_user]
+    if selection == "random":
+        if user_id is None or seed is None:
+            raise ValueError("random selection requires user_id and seed to stay deterministic")
+        rng = np.random.default_rng([seed, user_id])
+        picked = rng.choice(len(held_ids), size=max_items_per_user, replace=False)
+        return [held_ids[i] for i in sorted(picked)]
+    raise ValueError(f"Unknown item selection: {selection!r}")
 
 
 def _log_scored_pairs(pairs: list[tuple[int, int]]) -> None:
@@ -164,13 +187,22 @@ def score_associative(
     assignments,
     users: dict,
     max_items_per_user: int | None = None,
+    item_selection: str = "first",
+    seed: int | None = None,
 ) -> tuple[list[float], list[float], list[tuple[int, int]]]:
     """Score every selected held-out item with bias + dot-product.
 
     Pure computation, no MLflow, so tests can exercise the real code path.
     Returns (predicted, actual, pairs).
+
+    seed drives `random` item selection and defaults to the experiment's own
+    seed. It is an explicit parameter rather than a read of BASE_CONFIG so a
+    caller cannot end up sampling different items than the arm it is being
+    compared against without saying so.
     """
     cfg = BASE_CONFIG
+    if seed is None:
+        seed = cfg.random_seed
     all_predicted: list[float] = []
     all_actual: list[float] = []
     pairs: list[tuple[int, int]] = []
@@ -182,7 +214,10 @@ def score_associative(
         if held_out_df.empty:
             continue
 
-        held_ids = select_held_items(held_out_df, max_items_per_user)
+        held_ids = select_held_items(
+            held_out_df, max_items_per_user,
+            selection=item_selection, user_id=base_uid, seed=seed,
+        )
         actual_by_id = {
             int(mid): float(r)
             for mid, r in zip(held_out_df["movieId"], held_out_df["rating"])
@@ -207,6 +242,7 @@ def evaluate_associative(
     users: dict,
     run_name: str,
     max_items_per_user: int | None = None,
+    item_selection: str = "first",
 ) -> None:
     """Evaluate AssociativeAgent: bias + dot-product per held-out item.
 
@@ -221,14 +257,16 @@ def evaluate_associative(
         mlflow.log_params({
             "agent_type": "associative",
             "max_items_per_user": max_items_per_user,
-            "item_selection": "first",
+            "item_selection": item_selection,
             "eval_user_frac": cfg.eval_user_frac,
             "random_seed": cfg.random_seed,
             "eval_split": cfg.recommender_eval_split,
         })
 
         all_predicted, all_actual, pairs = score_associative(
-            env, assignments, users, max_items_per_user=max_items_per_user,
+            env, assignments, users,
+            max_items_per_user=max_items_per_user,
+            item_selection=item_selection,
         )
 
         metrics = _compute_metrics(all_predicted, all_actual)
@@ -254,6 +292,7 @@ def evaluate_llm(
     history_k: int,
     use_few_shot: bool,
     max_items_per_user: int = 5,
+    item_selection: str = "first",
 ) -> None:
     """Evaluate one LLM variant on the same held-out users.
 
@@ -288,7 +327,7 @@ def evaluate_llm(
             "llm_use_few_shot": use_few_shot,
             "llm_max_items_per_user": max_items_per_user,
             "max_items_per_user": max_items_per_user,
-            "item_selection": "first",
+            "item_selection": item_selection,
             "eval_user_frac": cfg.eval_user_frac,
             "random_seed": cfg.random_seed,
             "eval_split": cfg.recommender_eval_split,
@@ -310,7 +349,10 @@ def evaluate_llm(
 
                 # Cap items per user to keep runtime predictable. Shared with
                 # the associative arm so both score identical pairs.
-                held_ids = select_held_items(held_out_df, max_items_per_user)
+                held_ids = select_held_items(
+                    held_out_df, max_items_per_user,
+                    selection=item_selection, user_id=base_uid, seed=cfg.random_seed,
+                )
                 actual_by_id = {
                     int(mid): float(r)
                     for mid, r in zip(held_out_df["movieId"], held_out_df["rating"])
@@ -428,6 +470,17 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--item-selection",
+        choices=["first", "random"],
+        default="first",
+        help=(
+            "Which held-out items --max-items keeps. 'first' takes each user's "
+            "most recent ratings, since held-out rows are sorted timestamp "
+            "descending; 'random' samples uniformly, seeded per user. Default "
+            "is 'first' so the 2026-06-26 runs stay reproducible."
+        ),
+    )
+    parser.add_argument(
         "--max-items",
         type=int,
         default=None,
@@ -441,13 +494,19 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def baseline_run_name(max_items_per_user: int | None) -> str:
-    """Name the baseline run after its item cap.
+def baseline_run_name(max_items_per_user: int | None, item_selection: str = "first") -> str:
+    """Name the baseline run after its item cap and selection.
 
     The capped run must not collide with the uncapped `associative-baseline`
-    from 2026-06-26, which is kept so the two sit side by side in MLflow.
+    from 2026-06-26, which is kept so the two sit side by side in MLflow, and
+    the random-selection run must not collide with the first-N one, since
+    comparing those two is the whole point of measuring the recency bias.
     """
-    return "associative-baseline" if max_items_per_user is None else "associative-baseline-capped"
+    if max_items_per_user is None:
+        return "associative-baseline"
+    if item_selection == "first":
+        return "associative-baseline-capped"
+    return f"associative-baseline-capped-{item_selection}"
 
 
 def main() -> None:
@@ -460,18 +519,20 @@ def main() -> None:
     )
 
     max_items = args.max_items  # None = full held-out set
-    run_name = baseline_run_name(max_items)
+    selection = args.item_selection
+    run_name = baseline_run_name(max_items, selection)
 
     print(f"=== {EXPERIMENT_NAME} ===")
     print(f"  eval_user_frac: {BASE_CONFIG.eval_user_frac}  |  seed: {BASE_CONFIG.random_seed}")
-    print(f"  max_items_per_user: {max_items or 'all (~45/user)'}")
+    print(f"  max_items_per_user: {max_items or 'all (~45/user)'}  |  item_selection: {selection}")
     print(f"  MLflow: {MLFLOW_URI}  →  experiment '{EXPERIMENT_NAME}'\n")
 
     env, assignments, users = _setup()
 
     print(f"[1] Associative baseline → run '{run_name}'")
     evaluate_associative(
-        env, assignments, users, run_name=run_name, max_items_per_user=max_items,
+        env, assignments, users, run_name=run_name,
+        max_items_per_user=max_items, item_selection=selection,
     )
 
     if not variants_to_run:
@@ -483,6 +544,7 @@ def main() -> None:
     for i, variant in enumerate(variants_to_run, 1):
         run_name = variant["run_name"]
         kwargs = {k: v for k, v in variant.items() if k != "run_name"}
+        kwargs["item_selection"] = selection
         if max_items is not None:
             kwargs["max_items_per_user"] = max_items
         print(f"  [{i}/{len(variants_to_run)}] {run_name}")

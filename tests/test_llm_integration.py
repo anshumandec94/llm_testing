@@ -365,3 +365,159 @@ class TestMatchedItemSelection:
 
         assert baseline_run_name(None) == "associative-baseline"
         assert baseline_run_name(5) == "associative-baseline-capped"
+
+
+# ── Sampled item selection ────────────────────────────────────────────────────
+# Issue #3. The cap is a positional slice and held-out rows are sorted by
+# timestamp descending, so "first N" is each user's most recent ratings rather
+# than a neutral subset. `random` exists to measure how much that matters.
+
+
+class TestItemSelection:
+    """`--item-selection random` must be a real sample and still deterministic."""
+
+    @pytest.fixture(scope="class")
+    def eval_context(self, tiny_config, env):
+        rng = np.random.default_rng(tiny_config.random_seed)
+        assignments = build_user_assignments(tiny_config, env, rng)
+        users, _ = SimulatedUser.build_population(tiny_config, env, rng, assignments=assignments)
+        return assignments, users
+
+    def _held(self, env, assignments):
+        """A user with strictly more held-out items than the cap under test."""
+        for assignment in assignments:
+            df = env.held_out_for_user(assignment.base_user_id)
+            if len(df) > 2:
+                return assignment.base_user_id, df
+        pytest.skip("fixture has no user with more than 2 held-out items")
+
+    def test_random_selection_is_deterministic(self, env, eval_context):
+        """Same seed and user must reproduce the same sample exactly."""
+        from experiments.llm_vs_associative import select_held_items
+
+        assignments, _ = eval_context
+        uid, df = self._held(env, assignments)
+        a = select_held_items(df, 2, selection="random", user_id=uid, seed=42)
+        b = select_held_items(df, 2, selection="random", user_id=uid, seed=42)
+        assert a == b
+
+    def test_random_selection_depends_on_the_seed(self, env, eval_context):
+        """A different seed must be able to produce a different sample.
+
+        Guards against the sample silently collapsing to the positional head,
+        which would make the recency measurement meaningless.
+        """
+        from experiments.llm_vs_associative import select_held_items
+
+        assignments, _ = eval_context
+        uid, df = self._held(env, assignments)
+        samples = {
+            tuple(select_held_items(df, 2, selection="random", user_id=uid, seed=s))
+            for s in range(40)
+        }
+        assert len(samples) > 1
+
+    def test_random_selection_is_independent_of_user_iteration_order(self, env, eval_context):
+        """Seeding is derived from (seed, user_id), not a shared stream.
+
+        A shared RNG advanced across users would make each user's sample depend
+        on how many users preceded it, so filtering the population would
+        silently change everyone's items.
+        """
+        from experiments.llm_vs_associative import select_held_items
+
+        assignments, _ = eval_context
+        uid, df = self._held(env, assignments)
+        expected = select_held_items(df, 2, selection="random", user_id=uid, seed=42)
+
+        for other in assignments:
+            other_df = env.held_out_for_user(other.base_user_id)
+            select_held_items(other_df, 2, selection="random",
+                              user_id=other.base_user_id, seed=42)
+
+        assert select_held_items(df, 2, selection="random", user_id=uid, seed=42) == expected
+
+    def test_random_selection_returns_held_out_order(self, env, eval_context):
+        """Sampled ids come back in held-out order, not draw order."""
+        from experiments.llm_vs_associative import select_held_items
+
+        assignments, _ = eval_context
+        uid, df = self._held(env, assignments)
+        full = select_held_items(df, None)
+        picked = select_held_items(df, 2, selection="random", user_id=uid, seed=42)
+        assert picked == [i for i in full if i in picked]
+
+    def test_random_selection_samples_without_replacement(self, env, eval_context):
+        """No duplicated items, and exactly the cap many."""
+        from experiments.llm_vs_associative import select_held_items
+
+        assignments, _ = eval_context
+        uid, df = self._held(env, assignments)
+        picked = select_held_items(df, 2, selection="random", user_id=uid, seed=42)
+        assert len(picked) == 2
+        assert len(set(picked)) == 2
+        assert set(picked).issubset(set(select_held_items(df, None)))
+
+    def test_selections_agree_when_the_cap_exceeds_the_history(self, env, eval_context):
+        """Below the cap there is nothing to choose, so both return everything."""
+        from experiments.llm_vs_associative import select_held_items
+
+        assignments, _ = eval_context
+        uid, df = self._held(env, assignments)
+        first = select_held_items(df, 10_000, selection="first")
+        rand = select_held_items(df, 10_000, selection="random", user_id=uid, seed=42)
+        assert first == rand == select_held_items(df, None)
+
+    def test_random_selection_requires_a_seed_and_user(self, env, eval_context):
+        """Silently non-deterministic sampling would poison the comparison."""
+        from experiments.llm_vs_associative import select_held_items
+
+        assignments, _ = eval_context
+        uid, df = self._held(env, assignments)
+        with pytest.raises(ValueError, match="deterministic"):
+            select_held_items(df, 2, selection="random", user_id=uid, seed=None)
+        with pytest.raises(ValueError, match="deterministic"):
+            select_held_items(df, 2, selection="random", user_id=None, seed=42)
+
+    def test_unknown_selection_is_rejected(self, env, eval_context):
+        """A typo must fail loudly rather than falling back to 'first'."""
+        from experiments.llm_vs_associative import select_held_items
+
+        assignments, _ = eval_context
+        uid, df = self._held(env, assignments)
+        with pytest.raises(ValueError, match="Unknown item selection"):
+            select_held_items(df, 2, selection="most_recent", user_id=uid, seed=42)
+
+    def test_both_arms_stay_matched_under_random_selection(self, tiny_config, env, eval_context):
+        """The #2 guarantee must survive the new selection mode."""
+        from experiments.llm_vs_associative import score_associative, select_held_items
+
+        assignments, users = eval_context
+        _, _, associative_pairs = score_associative(
+            env, assignments, users, max_items_per_user=2, item_selection="random",
+            seed=tiny_config.random_seed,
+        )
+
+        llm_pairs: list[tuple[int, int]] = []
+        for assignment in assignments:
+            df = env.held_out_for_user(
+                assignment.base_user_id, split=tiny_config.recommender_eval_split,
+            )
+            if df.empty:
+                continue
+            for mid in select_held_items(
+                df, 2, selection="random",
+                user_id=assignment.base_user_id, seed=tiny_config.random_seed,
+            ):
+                llm_pairs.append((assignment.base_user_id, mid))
+
+        assert associative_pairs == llm_pairs
+        assert len(associative_pairs) > 0
+
+    def test_run_names_distinguish_the_two_selections(self):
+        """Comparing first-N against random-N requires two distinct runs."""
+        from experiments.llm_vs_associative import baseline_run_name
+
+        assert baseline_run_name(5, "first") == "associative-baseline-capped"
+        assert baseline_run_name(5, "random") == "associative-baseline-capped-random"
+        assert baseline_run_name(None, "random") == "associative-baseline"
