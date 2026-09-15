@@ -295,6 +295,47 @@ class TestPaddingContributesNothing:
         assert float(losses.total.detach()) == 0.0
         assert torch.isfinite(losses.total)
 
+    def test_partially_padded_rows_are_finite_with_key_masking_on(self, batch):
+        """
+        The NaN case that actually bites, and the reason divergence 10 is
+        implemented rather than merely noted.
+
+        A *fully* padded row is safe: torch resolves it to zeros. A *partially*
+        padded, left-padded row is not. Its position 0 may attend only to
+        position 0 under the causal mask, and that position is a masked pad, so
+        the softmax runs over an empty set and returns NaN. The NaN then
+        survives the post-block zeroing because 0 * NaN is NaN, and poisons
+        every gradient in the batch.
+        """
+        log_seqs, pos_seqs, neg_seqs, residuals = batch
+        model = build_model(mask_padded_keys=True)
+        assert bool((log_seqs == PAD_INDEX).any())
+        assert bool((log_seqs != PAD_INDEX).any())
+
+        feats = model.log2feats(log_seqs, residuals)
+        assert torch.isfinite(feats).all(), "NaN from a fully masked query row"
+
+        model.train()
+        pos_logits, neg_logits, predicted = model(
+            log_seqs, pos_seqs, neg_seqs, residuals, residual_std=1.0
+        )
+        losses = model.losses(
+            pos_logits, neg_logits, predicted, torch.randn(BATCH, MAXLEN), pos_seqs
+        )
+        assert torch.isfinite(losses.total)
+        losses.total.backward()
+        for name, param in model.named_parameters():
+            if param.grad is not None:
+                assert torch.isfinite(param.grad).all(), f"NaN gradient in {name}"
+
+    def test_key_masking_still_zeroes_padded_positions(self, batch):
+        """Permitting self-attention at pads must not leak state past the block."""
+        log_seqs, _, _, residuals = batch
+        model = build_model(mask_padded_keys=True)
+        feats = model.log2feats(log_seqs, residuals)
+        pad = log_seqs == PAD_INDEX
+        assert torch.allclose(feats[pad], torch.zeros_like(feats[pad]), atol=1e-6)
+
     def test_all_padding_batch_is_finite_with_key_masking_on(self):
         """
         A fully padded row masks every key. torch 2.10 resolves that to zeros,
@@ -691,10 +732,20 @@ class TestInferenceMode:
         # Padded rows are zeroed either way; the real positions must differ.
         assert not torch.allclose(unmasked[~pad], masked[~pad], atol=1e-4)
 
-    def test_defaults_follow_pmixer_not_kang205(self):
-        model = build_model()
-        assert model.norm_first is False, "pmixer defaults to post-norm"
-        assert model.mask_padded_keys is False, "pmixer does not mask padded keys"
+    def test_norm_order_defaults_to_pmixer(self):
+        assert SimConfig().sasrec_norm_first is False, "pmixer defaults to post-norm"
+        assert SASRec(item_num=ITEM_NUM, maxlen=MAXLEN).norm_first is False
+
+    def test_padded_keys_are_masked_by_default(self):
+        """
+        The one divergence where we deliberately do NOT follow pmixer.
+        Decided 2026-09-15: 79% of ML-32M users have fewer than 200 ratings, so
+        four in five carry padding, the attention dilution is worst where
+        histories are shortest, and the associative arm has no equivalent
+        handicap. See reports/sasrec_port_divergences.md.
+        """
+        assert SimConfig().sasrec_mask_padded_keys is True
+        assert SASRec(item_num=ITEM_NUM, maxlen=MAXLEN).mask_padded_keys is True
 
     def test_divergences_are_documented_in_the_module_docstring(self):
         import sim.agents.sasrec_model as module

@@ -131,9 +131,14 @@ class SimConfig:
     # TensorFlow original but not identical to it.
     sasrec_norm_first: bool = False
     # pmixer lets padded timesteps act as attention keys; kang205 masks them
-    # out. False is the pmixer behaviour, True the kang205 behaviour, exposed
-    # so the difference can be measured rather than argued about.
-    sasrec_mask_padded_keys: bool = False
+    # out. False is the pmixer behaviour, True the kang205 behaviour.
+    # Defaults to True (kang205) by Anshuman's decision on 2026-09-15,
+    # overriding the plan's blanket "pmixer is authoritative" for this one
+    # case: 79% of ML-32M users have fewer than 200 ratings, so four in five
+    # carry padding, the attention dilution is worst where histories are
+    # shortest, and the associative arm has no equivalent handicap. See
+    # reports/sasrec_port_divergences.md.
+    sasrec_mask_padded_keys: bool = True
     # Weight on the rating head in L = L_bce + w * L_mse. 0.0 is the ablation
     # that measures what the rating head cost the ranking objective.
     sasrec_rating_loss_weight: float = 1.0

@@ -30,7 +30,7 @@ Three larger issues sit outside that list entirely, and one of them is not a bug
 | Concern | Real impact on the comparison | Action |
 |---|---|---|
 | Div 1: post-norm vs pre-norm | **None.** pmixer's own benchmark says our default is the best of the three on MovieLens | Settled, no change |
-| Div 3: padded timesteps attendable as keys | **Moderate.** Affects 79% of users | Recommend flipping the flag |
+| Div 3: padded timesteps attendable as keys | **Moderate.** Affects 79% of users | **DONE 2026-09-15: flag flipped to True** |
 | Div 9: no `W_O` in the TF original | **None.** We have more capacity, not less | No change |
 | Divs 2, 4, 5, 6, 7, 8, 10 | **None.** Cosmetic, notational, or already matched | No change |
 | `maxlen=200` on ML-32M | **Large.** Discards 39% of all interactions | Needs a decision before real runs |
@@ -102,12 +102,24 @@ On ML-32M:
 The project page already records that per-user MAE correlates with rating count, and that the statistical unit for this benchmark is users rather than items.
 A defect concentrated in 79% of users, worst where histories are shortest, is exactly the shape that moves a user-clustered mean.
 
-**Recommendation: flip `sasrec_mask_padded_keys` to `True`.**
-The flag already exists and is tested. This is a one-line config change.
-The argument for keeping `False` is fidelity to pmixer; the argument for `True` is that kang205 masks, the paper's numbers come from the masking version, and the unmasked behaviour looks like an oversight in a port rather than a design choice.
-I left the default at `False` because "pmixer is authoritative" is a decision recorded in your plan and I did not want to quietly reverse it, but on the merits I think `True` is correct and I would change it.
+**Resolved 2026-09-15: `sasrec_mask_padded_keys` now defaults to `True`.**
+Anshuman took this decision, which overrides the plan's blanket "pmixer is authoritative" for this one case.
+This is the only divergence of the ten where the port does not follow pmixer.
 
-I have not measured the size of the effect. That is cheap to do once #18 exists, by training the same config twice, and it is worth doing rather than assuming.
+**Flipping it surfaced a latent NaN, and the lesson generalises.**
+Key masking cannot simply be handed to torch's `key_padding_mask`.
+Combined with the causal mask it leaves a left-padded query with no legal key at all: position 0 of a padded row may attend only to position 0, which is itself a masked pad, so the softmax runs over an empty set and returns NaN.
+The NaN then survives the post-block zeroing, because `0 * NaN` is `NaN`, and poisons every gradient in the batch.
+
+This is exactly what kang205's query masking (divergence 10) exists to prevent, which is only obvious in hindsight.
+The port now always permits a position to attend to itself, which is cheaper than a second mask and leaves real positions untouched because their diagonal was already legal.
+
+An earlier version of this analysis claimed torch handled fully-masked rows safely.
+That was tested, but on the wrong case: a *fully* padded row is indeed safe and resolves to zeros, while a *partially* padded row is not.
+Every left-padded batch contains the dangerous case, so it would have fired on the first real training run.
+
+The size of the masking effect on the final metric is still unmeasured.
+That is cheap once #18 exists, by training the same config twice, and is worth doing rather than assuming.
 
 ### Divergence 9: no output projection in the TensorFlow original. Not a risk.
 
@@ -200,8 +212,8 @@ If it does not beat the null, something is wrong with the arm and the port is th
 
 In order:
 
-1. **Flip `sasrec_mask_padded_keys` to `True`.** One line. It affects 79% of users, worst where histories are shortest, and the unmasked version looks like a port oversight rather than a design choice. This is the only divergence I would change.
-2. **Decide `maxlen` deliberately** before the real runs, knowing 200 discards 39% of the data and 1000 costs about 25 times the attention compute of 200.
+1. ~~Flip `sasrec_mask_padded_keys` to `True`.~~ **Done 2026-09-15.** It surfaced a latent NaN in the process; see divergence 3 above.
+2. **Decide `maxlen` deliberately** before the real runs, knowing 200 discards 39% of the data and 1000 costs about 25 times the attention compute of 200. **This is now largely superseded by issue #24 (sliding windows):** once long histories yield several contiguous training windows instead of one truncated tail, `maxlen` governs only inference context and attention cost, not how much data training sees. That decouples the two and makes a moderate `maxlen` cheap in accuracy terms. Decide `maxlen` after #24 lands, not before.
 3. **Compute the bias-only null early**, as the plan says. It is 15 seconds and it calibrates every other number, including the ones already published in `reports/llm_vs_associative.md`.
 4. **Do not tune SASRec until it wins.** Fix defects that have a mechanism, like items 1 and 2. Report the result you get.
 5. When #18 exists, spend the cheap smoke-scale budget on the two ablations that already have flags: `sasrec_mask_padded_keys` and `sasrec_rating_loss_weight=0`.

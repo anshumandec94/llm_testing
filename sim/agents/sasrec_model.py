@@ -56,10 +56,13 @@ Divergences between kang205 (TF) and pmixer (PyTorch)
    ``key_padding_mask``, so a padded position is a real, attendable key: its
    projected value is the bias term, which is constant but not zero, and it
    dilutes the attention distribution. Since sequences are left-padded and the
-   mask is causal, every position can see every pad. We default to pmixer's
-   behaviour and expose ``sasrec_mask_padded_keys`` to switch to kang205's,
-   because this is a genuine modelling difference and guessing is worse than
-   measuring.
+   mask is causal, every position can see every pad. **This is the one
+   divergence where we do not follow pmixer.** Anshuman decided on 2026-09-15
+   to default ``sasrec_mask_padded_keys`` to True, i.e. kang205's behaviour,
+   because 79% of ML-32M users have fewer than 200 ratings, so four in five
+   carry padding, the dilution is worst where histories are shortest, and the
+   associative arm this is benchmarked against has no equivalent handicap. The
+   flag remains so the pmixer behaviour can still be measured.
 
 4. **Zeroing padded timesteps.** kang205 applies ``seq *= mask`` after the
    embedding dropout and after each block. pmixer did the same via a
@@ -106,15 +109,20 @@ Divergences between kang205 (TF) and pmixer (PyTorch)
 
 10. **Query masking.** kang205 zeroes the softmax weights of padded *query*
     rows before the weighted sum, so a padded query's attention output is
-    exactly zero before its residual add. pmixer has no equivalent, and neither
-    do we. This is distinct from divergence 3, which is about padded *keys*,
-    and from divergence 4, which zeroes after the residual and the LayerNorm
-    rather than inside the attention. We re-introduced kang205's post-block
-    zeroing because the parity checklist asks for it, and it makes the query
-    mask redundant for anything downstream: a padded position's state is forced
-    to zero at the end of every block either way. The two differ only in what
-    the padded position contributes *within* a block, which nothing reads,
-    since padded targets are masked out of both losses.
+    exactly zero before its residual add. pmixer has no equivalent. This is
+    distinct from divergence 3, which is about padded *keys*, and from
+    divergence 4, which zeroes after the residual and the LayerNorm rather than
+    inside the attention.
+
+    Once divergence 3 is enabled this stops being optional. A left-padded query
+    has no legal key: position 0 of a padded row may attend only to position 0,
+    which is itself a masked pad, so the softmax runs over an empty set and
+    returns NaN, which survives the post-block zeroing because ``0 * NaN`` is
+    NaN. kang205's query mask is what prevents this. We achieve the same result
+    by always permitting a position to attend to itself, which is cheaper than
+    a second mask and leaves real positions untouched, since their diagonal was
+    already legal. The padded position then attends only to its own zeroed
+    state and is discarded by the post-block zeroing regardless.
 
 Not a divergence, but worth stating: both scale the item embeddings by
 ``sqrt(hidden_units)`` before the first block and neither scales the positional
@@ -186,7 +194,7 @@ class SASRec(nn.Module):
         dropout_rate: float = 0.2,
         maxlen: int = 200,
         norm_first: bool = False,
-        mask_padded_keys: bool = False,
+        mask_padded_keys: bool = True,
         inject_rating: bool = True,
         rating_head_hidden: int = 64,
         rating_loss_weight: float = 1.0,
@@ -194,6 +202,7 @@ class SASRec(nn.Module):
         super().__init__()
         self.item_num = item_num
         self.hidden_units = hidden_units
+        self.num_heads = num_heads
         self.maxlen = maxlen
         self.norm_first = norm_first
         self.mask_padded_keys = mask_padded_keys
@@ -350,13 +359,36 @@ class SASRec(nn.Module):
         seqs = seqs * ~padding_mask.unsqueeze(-1)
 
         seq_len = seqs.shape[1]
-        attention_mask = ~torch.tril(
+        causal = ~torch.tril(
             torch.ones((seq_len, seq_len), dtype=torch.bool, device=seqs.device)
         )
-        # Divergence 3: off by default, matching pmixer. A fully padded row
-        # masks every key, which torch 2.10 resolves to zeros rather than the
-        # NaN an unguarded softmax over -inf would give; tested, not assumed.
-        key_padding_mask = padding_mask if self.mask_padded_keys else None
+
+        # Divergence 3: on by default, which is kang205's behaviour and the one
+        # place we depart from pmixer.
+        #
+        # Key masking cannot be handed to `key_padding_mask` directly. Combined
+        # with the causal mask it leaves a left-padded query with no legal key
+        # at all: position 0 of a padded row may attend only to position 0,
+        # which is itself a masked pad, so the softmax runs over an empty set
+        # and yields NaN. That NaN then survives the post-block zeroing,
+        # because 0 * NaN is NaN, and poisons the whole batch.
+        #
+        # kang205 avoids this with a separate query mask (divergence 10), which
+        # zeroes the attention output at padded query positions. We get the
+        # same result more cheaply by always letting a position attend to
+        # itself. A padded position then attends only to its own zeroed state,
+        # which is well defined, and the post-block zeroing discards it anyway.
+        # Real positions are unaffected: their diagonal was already legal.
+        key_padding_mask = None
+        if self.mask_padded_keys:
+            blocked = causal.unsqueeze(0) | padding_mask.unsqueeze(1)
+            self_attention = torch.eye(
+                seq_len, dtype=torch.bool, device=seqs.device
+            )
+            blocked = blocked & ~self_attention
+            attention_mask = blocked.repeat_interleave(self.num_heads, dim=0)
+        else:
+            attention_mask = causal
 
         for i in range(len(self.attention_layers)):
             if self.norm_first:
