@@ -115,6 +115,39 @@ class SimConfig:
     # Whether to prepend fixed few-shot examples to anchor output format.
     llm_use_few_shot: bool = True
 
+    # ── SASRec ─────────────────────────────────────────────────────────────
+    # Architecture defaults are the reference MovieLens settings, shared by
+    # kang205/SASRec and pmixer/SASRec.pytorch. See sim/agents/sasrec_model.py
+    # for the full parity notes and the divergences between the two.
+    sasrec_hidden_units: int = 50
+    sasrec_num_blocks: int = 2
+    sasrec_num_heads: int = 1
+    sasrec_dropout_rate: float = 0.2
+    # Sequence length. 200 is the reference ML-1M setting; ML-32M histories run
+    # longer, so this is worth revisiting before the real runs.
+    sasrec_maxlen: int = 200
+    # False reproduces pmixer's default post-norm block, which is the port
+    # target. True switches to pre-norm, which is closer to the published
+    # TensorFlow original but not identical to it.
+    sasrec_norm_first: bool = False
+    # pmixer lets padded timesteps act as attention keys; kang205 masks them
+    # out. False is the pmixer behaviour, True the kang205 behaviour.
+    # Defaults to True (kang205) by Anshuman's decision on 2026-09-15,
+    # overriding the plan's blanket "pmixer is authoritative" for this one
+    # case: 79% of ML-32M users have fewer than 200 ratings, so four in five
+    # carry padding, the attention dilution is worst where histories are
+    # shortest, and the associative arm has no equivalent handicap. See
+    # reports/sasrec_port_divergences.md.
+    sasrec_mask_padded_keys: bool = True
+    # Weight on the rating head in L = L_bce + w * L_mse. 0.0 is the ablation
+    # that measures what the rating head cost the ranking objective.
+    sasrec_rating_loss_weight: float = 1.0
+    # Whether input positions carry their debiased residual alongside the item
+    # id. Behind a flag so the rating-context contribution can be ablated.
+    sasrec_inject_rating: bool = True
+    # Hidden width of the rating head MLP.
+    sasrec_rating_head_hidden: int = 64
+
     def as_dict(self) -> dict:
         """Return a flat dict of all parameters (for MLflow logging)."""
         return {
@@ -150,6 +183,16 @@ class SimConfig:
             "llm_max_tokens": self.llm_max_tokens,
             "llm_overview_max_chars": self.llm_overview_max_chars,
             "llm_use_few_shot": self.llm_use_few_shot,
+            "sasrec_hidden_units": self.sasrec_hidden_units,
+            "sasrec_num_blocks": self.sasrec_num_blocks,
+            "sasrec_num_heads": self.sasrec_num_heads,
+            "sasrec_dropout_rate": self.sasrec_dropout_rate,
+            "sasrec_maxlen": self.sasrec_maxlen,
+            "sasrec_norm_first": self.sasrec_norm_first,
+            "sasrec_mask_padded_keys": self.sasrec_mask_padded_keys,
+            "sasrec_rating_loss_weight": self.sasrec_rating_loss_weight,
+            "sasrec_inject_rating": self.sasrec_inject_rating,
+            "sasrec_rating_head_hidden": self.sasrec_rating_head_hidden,
         }
 
     def to_json_dict(self) -> dict:

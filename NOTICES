@@ -1,0 +1,35 @@
+NOTICES
+=======
+
+Third-party work this repository derives from.
+Each entry records what was derived, from where, and under what licence.
+
+
+SASRec
+------
+
+Files: sim/agents/sasrec_model.py
+
+`sim/agents/sasrec_model.py` is a derived port of SASRec. The backbone follows
+the reference implementations closely; the rating head, the rating-context
+injection and the joint objective are additions specific to this project.
+
+Method:
+  Wang-Cheng Kang and Julian McAuley.
+  "Self-Attentive Sequential Recommendation."
+  IEEE International Conference on Data Mining (ICDM), 2018.
+
+Sources consulted:
+  kang205/SASRec           https://github.com/kang205/SASRec
+    The TensorFlow original, behind the published numbers.
+    Apache License 2.0.
+
+  pmixer/SASRec.pytorch    https://github.com/pmixer/SASRec.pytorch
+    The PyTorch port, and the authoritative reference for this port because
+    the target is PyTorch.
+    Apache License 2.0.
+
+Both are Apache-2.0 licensed, which permits derived works provided the licence
+and attribution are retained. Divergences between the two references, and the
+choice made at each, are documented in the module docstring of
+`sim/agents/sasrec_model.py`.
