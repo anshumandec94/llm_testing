@@ -151,7 +151,7 @@ def main(argv: list[str] | None = None) -> None:
         baselines=tuple(ns.baselines),
         mlflow_uri=ns.mlflow_uri,
     )
-    with pd.option_context("display.float_format", "{:.4f}".format, "display.width", 120):
+    with pd.option_context("display.float_format", "{:.4f}".format, "display.max_columns", None, "display.width", None):
         print(table.drop(columns="mlflow_run_id"))
 
 
