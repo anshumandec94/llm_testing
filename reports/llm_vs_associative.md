@@ -307,6 +307,22 @@ It holds on every selection, against the clamped null:
 So the issue's done-condition is met: the SVD arm beats the bias-only null with a paired interval excluding zero, at both scales and on every selection.
 The ALS is noisier at 128 users, and on random-5 there its interval spans zero; at 2566 users every ALS interval excludes zero by a wide margin.
 
+**The ALS figure depends on its random start, and the fit has not fully converged.**
+The PR #30 review refitted it under other seeds and iteration counts, on recent-5 against the clamped null:
+
+| Setting | 2566 users | 128 users |
+|---|---|---|
+| seed 42, 10 iterations (committed) | -0.0423 | -0.0396 |
+| seed 0 | -0.0462 | -0.0341 |
+| seed 1 | -0.0442 | -0.0440 |
+| seed 7 | -0.0447 | -0.0412 |
+| seed 42, 30 iterations | -0.0438 | -0.0434 |
+| seed 0, 30 iterations | -0.0468 | -0.0324, CI -0.069 to +0.004 |
+
+At 2566 users the conclusion is robust: -0.042 to -0.047, every t above 11, and 6.0 to 6.7 times the SVD's gain, with the committed seed the least favourable.
+At 128 users the spread is about 0.012, roughly 30% of the effect, and one setting's interval spans zero, so **the 128-user ALS "Yes" in the table above is not robust** and only the 2566-user ALS result should be relied on.
+These refits are review probes, not committed code; the committed script fits the one configuration.
+
 ### The small SVD gain is estimator shrinkage, not a limit of the representation
 
 The SVD's gain is about 1% of the null's error.
@@ -316,14 +332,14 @@ It is what a zero-imputed SVD of them adds.
 The residual matrix is about 0.2% observed.
 `TruncatedSVD` treats every unobserved cell as a residual of exactly zero, so a rank-8 fit spends its capacity reconstructing zeros and pulls every prediction toward zero.
 ALS, which fits observed cells only, removes that and nothing else: same residuals, same dimension, same train split, same pairs.
-It is a secondary diagnostic, fitted once with one untuned configuration (`lambda = 5`, 10 iterations, seed 42) chosen before any held-out number was seen, and it is not proposed here as the replacement baseline; that choice belongs to issue #13.
+It is a secondary diagnostic, fitted with one untuned configuration (`lambda = 5`, 10 iterations, seed 42), taken unchanged from the review probe that first raised the issue rather than tuned on held-out results, and it is not proposed here as the replacement baseline; that choice belongs to issue #13.
 
 Measured on the recent-5 pairs, against the true residual `rating - bias`:
 
 | | SVD, 128 / 2566 | ALS, 128 / 2566 | Published arm, 128 / 2566 |
 |---|---|---|---|
 | Mean of the added term | +0.007 / +0.005 | +0.005 / +0.052 | +0.40 / +0.38 |
-| Std of the added term | 0.052 / 0.054 | 0.45 / 0.42 | 0.23 (128 users) |
+| Std of the added term | 0.052 / 0.054 | 0.45 / 0.42 | 0.23 / 0.24 |
 | Correlation with the true residual | 0.197 / 0.174 | 0.337 / 0.328 | 0.021 / 0.068 |
 | Least-squares scale, first-5 | 3.56 / 3.01 | 0.71 / 0.71 | 0.008 / 0.125 |
 | Least-squares scale, all held-out | 2.81 / 2.53 | 0.64 / 0.75 | |
@@ -334,7 +350,7 @@ Measured on the recent-5 pairs, against the true residual `rating - bias`:
 Three things follow.
 
 - **The SVD term is too small by a factor of about 3 on held-out pairs, and about 1.7 even on its own training cells.** A term in the right units has a least-squares scale near 1. Being too small in-sample is the signature of shrinkage, since no generalisation gap exists there.
-- **The ALS term is on the right scale in-sample (1.05) and slightly too large on held-out pairs (0.64 to 0.75).** That is ordinary overfitting at an untuned regularisation, the opposite direction to the SVD's problem.
+- **The ALS term is on the right scale in-sample (1.05) and too large on held-out pairs, by 25 to 36% (scale 0.64 to 0.75, and 0.52 on 128-user random-5).** That is ordinary overfitting at an untuned regularisation, the opposite direction to the SVD's problem. Its mean is also +0.052 at 2566 users on recent-5 (+0.039 on all held-out items), a small positive offset of the kind the published arm had in much larger form, which a tuned fit would need to watch.
 - **The gap between in-sample and held-out scale is partly generalisation and recency, not only shrinkage.** For the SVD it grows from 1.7 in-sample to 2.5 to 2.8 on all held-out items and 3.0 to 3.6 on the recent-5 slice.
 
 The SVD was deliberately **not** rescaled.
@@ -358,7 +374,7 @@ Paired differences against the clamped null, same pairs:
 | 2566 | ALS | 8 | 0.6515 | -0.042 (-11.1) | 0.6082 | -0.045 (-19.6) | 0.71 |
 
 More SVD dimensions help a little and shrink a little less, with nothing gained past 32 at 2566 users.
-An 8-dim ALS beats a 64-dim SVD by about 0.03 MAE at 2566 users.
+An 8-dim ALS beats a 64-dim SVD by about 0.03 MAE at 2566 users (an unpaired difference of MAEs; the paired ALS-minus-SVD difference at k = 8 is -0.035, CI -0.042 to -0.028).
 Adding capacity to the zero-imputed estimator does not recover what changing the estimator does.
 ALS is swept at k = 8 only, because the vectorised solver's memory grows with k squared and a k = 32 fit did not fit in memory on the development machine.
 
