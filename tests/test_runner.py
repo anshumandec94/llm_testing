@@ -3,8 +3,10 @@ from __future__ import annotations
 from dataclasses import replace
 from typing import Any
 
+import mlflow
 import numpy as np
 import pandas as pd
+import pytest
 
 from sim.runner import SimulationRunner
 
@@ -206,11 +208,20 @@ class TestRecommenderOnlyProfile:
 
 
 class TestExplicitOnlyFeedback:
-    def test_user_session_filters_to_explicit_ratings_for_learning(
-        self, tiny_config, monkeypatch
-    ):
-        runner = SimulationRunner(tiny_config)
-        rng = np.random.default_rng(tiny_config.random_seed)
+    @pytest.fixture(autouse=True)
+    def _isolated_mlflow(self, tiny_config, tmp_path):
+        """
+        _setup_components sets MLflow tags, which opens a run implicitly when
+        none is active. Point MLflow at a temp dir and end that run, so it
+        neither writes to the repo's mlflow.db nor leaks into later tests.
+        """
+        self.config = replace(tiny_config, mlflow_tracking_uri=str(tmp_path / "mlruns"))
+        yield
+        mlflow.end_run()
+
+    def test_user_session_filters_to_explicit_ratings_for_learning(self, monkeypatch):
+        runner = SimulationRunner(self.config)
+        rng = np.random.default_rng(self.config.random_seed)
         ctx = runner._setup_components(rng)
         uid = ctx.env.eval_users[0]
         ua = ctx.users[uid]
@@ -257,10 +268,10 @@ class TestExplicitOnlyFeedback:
         assert residual == ctx.env.debias_rating(uid, rated_movie, 4.0)
 
     def test_explicit_only_feedback_debiases_against_base_user_in_replicated_mode(
-        self, tiny_config, monkeypatch
+        self, monkeypatch
     ):
         cfg = replace(
-            tiny_config,
+            self.config,
             agent_types=["associative", "item_item"],
             agent_assignment_mode="one_per_agent_type",
         )
