@@ -800,6 +800,7 @@ class TestConfigWiring:
             "sasrec_num_heads",
             "sasrec_dropout_rate",
             "sasrec_maxlen",
+            "sasrec_window_stride",
             "sasrec_norm_first",
             "sasrec_mask_padded_keys",
             "sasrec_rating_loss_weight",

@@ -126,6 +126,13 @@ class SimConfig:
     # Sequence length. 200 is the reference ML-1M setting; ML-32M histories run
     # longer, so this is worth revisiting before the real runs.
     sasrec_maxlen: int = 200
+    # Stride between contiguous training windows over one user's history
+    # (issue #24). None means "equal to sasrec_maxlen": disjoint windows, each
+    # training interaction a target once. Smaller values overlap windows and
+    # oversample heavy users; 0 and values above maxlen are rejected. Training
+    # only: inference always uses the most recent sasrec_maxlen items. See
+    # sim/agents/sasrec_data.py for the anchoring rule.
+    sasrec_window_stride: int | None = None
     # False reproduces pmixer's default post-norm block, which is the port
     # target. True switches to pre-norm, which is closer to the published
     # TensorFlow original but not identical to it.
@@ -188,6 +195,12 @@ class SimConfig:
             "sasrec_num_heads": self.sasrec_num_heads,
             "sasrec_dropout_rate": self.sasrec_dropout_rate,
             "sasrec_maxlen": self.sasrec_maxlen,
+            # Logged resolved, so MLflow never shows an ambiguous "None".
+            "sasrec_window_stride": (
+                self.sasrec_maxlen
+                if self.sasrec_window_stride is None
+                else self.sasrec_window_stride
+            ),
             "sasrec_norm_first": self.sasrec_norm_first,
             "sasrec_mask_padded_keys": self.sasrec_mask_padded_keys,
             "sasrec_rating_loss_weight": self.sasrec_rating_loss_weight,
