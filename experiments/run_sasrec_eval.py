@@ -38,7 +38,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from experiments import compare_backends
 from experiments.bias_only_null import ITEM_SELECTION, MAX_ITEMS
-from scripts.train_sasrec import CHECKPOINT_NAME, TrainingArgs, build_training_data, resolve_config, train
+import torch
+
+from scripts.train_sasrec import (
+    CHECKPOINT_NAME,
+    TrainingArgs,
+    _check_resumable,
+    build_training_data,
+    resolve_config,
+    train,
+)
 from sim.environment import Environment
 from sim.population import build_user_assignments
 
@@ -78,11 +87,21 @@ def run_eval(
     if skip_train:
         if not checkpoint.is_file():
             raise FileNotFoundError(f"--skip-train given but {checkpoint} does not exist")
+        # The same full-settings check a resume makes, so a checkpoint trained
+        # under different settings is never scored as if it matched.
+        _check_resumable(torch.load(checkpoint, map_location="cpu", weights_only=False), config, training_args)
     else:
         resume = checkpoint.is_file()
         logger.info("%s SASRec in %s", "Resuming" if resume else "Training", run_dir)
         run_dir.mkdir(parents=True, exist_ok=True)
         train(build_training_data(env, config), config, training_args, run_dir, resume=resume)
+
+    trained_epoch = int(torch.load(checkpoint, map_location="cpu", weights_only=False)["epoch"])
+    if trained_epoch > training_args.epochs:
+        logger.warning(
+            "checkpoint is at epoch %d, past the requested %d; scoring the epoch-%d model",
+            trained_epoch, training_args.epochs, trained_epoch,
+        )
 
     assignments = build_user_assignments(config, env, np.random.default_rng(config.random_seed))
     cap = f"{ITEM_SELECTION}{max_items}" if max_items else "all"
@@ -99,6 +118,7 @@ def run_eval(
         rows[name] = {**{k: metrics[k] for k in SUMMARY_COLUMNS}, "mlflow_run_id": run_id}
 
     table = pd.DataFrame.from_dict(rows, orient="index")
+    table["sasrec_epoch"] = trained_epoch
     table.index.name = "backend"
     table.to_csv(run_dir / "summary.csv")
     return table
