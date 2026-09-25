@@ -70,6 +70,15 @@ def test_trains_scores_and_resumes(tiny_sweep):
     assert payload["epoch"] == 2
     assert list(second.index) == list(first.index)
     assert second.loc["bias_only", "error/mae"] == first.loc["bias_only", "error/mae"]
+    assert (second["sasrec_epoch"] == 2).all()
+
+    # --skip-train refuses a checkpoint trained under different settings.
+    changed = dataclasses.replace(compare_backends.BASE_CONFIG, sasrec_dropout_rate=0.37)
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(compare_backends, "BASE_CONFIG", changed)
+        with pytest.raises(ValueError, match="different settings"):
+            run_eval("tiny", runs_dir=runs, training_args=TrainingArgs(epochs=2, batch_size=16),
+                     skip_train=True, baselines=(), mlflow_uri=uri, max_items=None)
 
 
 def test_cli_runs_from_anywhere(tiny_sweep, tmp_path, monkeypatch, capsys):
