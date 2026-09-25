@@ -130,6 +130,11 @@ def parse_args(argv: list[str] | None = None) -> SimConfig:
         ],
     )
     parser.add_argument(
+        "--sasrec_checkpoint_path",
+        default=defaults.sasrec_checkpoint_path,
+        help="SASRec checkpoint from scripts/train_sasrec.py; required for --agent_type seq2seq.",
+    )
+    parser.add_argument(
         "--agent_types",
         type=_parse_csv_list,
         default=defaults.agent_types,
@@ -200,6 +205,7 @@ def parse_args(argv: list[str] | None = None) -> SimConfig:
         mf_damping=args.mf_damping,
         semantic_model=args.semantic_model,
         agent_type=args.agent_type,
+        sasrec_checkpoint_path=args.sasrec_checkpoint_path,
         agent_types=args.agent_types,
         agent_type_proportions=args.agent_type_proportions,
         agent_assignment_mode=args.agent_assignment_mode,

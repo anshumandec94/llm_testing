@@ -31,6 +31,13 @@ nan predictions are excluded from every error metric, never imputed, so
 Usage:
     uv run python experiments/compare_backends.py --backend bias_only
     uv run python experiments/compare_backends.py --backend associative --sweep u2566
+    uv run python experiments/compare_backends.py --backend sasrec --checkpoint runs/sasrec/checkpoint.pt
+
+The SASRec arm scores a checkpoint from `scripts/train_sasrec.py`, which must
+have been trained on this run's split (the sweep's `eval_user_frac` on
+`BASE_CONFIG`) and `sasrec_maxlen`; anything else is refused. Its run also
+logs the checkpoint path as a param and its saved config as
+`sasrec_checkpoint_config.json`.
 """
 
 import argparse
@@ -52,6 +59,7 @@ from experiments.backends import (
     BiasOnlyBackend,
     LLMBackend,
     PreferenceBackend,
+    SASRecBackend,
 )
 from experiments.bias_only_null import ITEM_SELECTION, MAX_ITEMS, SWEEPS, clustered_mae
 from experiments.llm_vs_associative import BASE_CONFIG, MLFLOW_URI, _log_scored_pairs, select_held_items
@@ -69,11 +77,18 @@ logger = logging.getLogger(__name__)
 EXPERIMENT_NAME = "backend-comparison"
 # Backends the harness can construct. The rest of BACKEND_REGISTRY are stubs
 # that raise NotImplementedError from their constructor.
-BUILDABLE = ("bias_only", "associative", "llm")
+BUILDABLE = ("bias_only", "associative", "llm", "sasrec")
 
 
-def build_backend(name: str, env: Environment) -> PreferenceBackend:
-    """Construct one arm. The LLM uses the config's default LLM settings."""
+def build_backend(name: str, env: Environment, checkpoint: Path | None = None) -> PreferenceBackend:
+    """Construct one arm. The LLM uses the config's default LLM settings.
+
+    `checkpoint` is required for, and only used by, `sasrec`.
+    """
+    if name == "sasrec":
+        if checkpoint is None:
+            raise ValueError("the sasrec backend needs a checkpoint (--checkpoint)")
+        return SASRecBackend.from_checkpoint(env, checkpoint)
     if name == "bias_only":
         return BiasOnlyBackend()
     if name == "associative":
@@ -184,7 +199,11 @@ def run_backend(
     tracking_uri: str,
     run_name: str,
 ) -> tuple[str, dict[str, float]]:
-    """Score `backend` and log one MLflow run. Returns (run_id, metrics)."""
+    """Score `backend` and log one MLflow run. Returns (run_id, metrics).
+
+    A backend with a `describe()` (SASRec) also logs the params and the saved
+    training config it returns, so the run names the model it scored.
+    """
     frame = score_backend(
         env, assignments, backend, max_items_per_user, item_selection,
         seed=cfg.random_seed, split=cfg.recommender_eval_split,
@@ -203,6 +222,11 @@ def run_backend(
             "split_cache_key": cfg.split_cache_key(),
         })
         mlflow.log_metrics(metrics)
+        describe = getattr(backend, "describe", None)
+        if callable(describe):
+            params, trained_config = describe()
+            mlflow.log_params(params)
+            mlflow.log_dict(trained_config, f"{backend.name}_checkpoint_config.json")
         _log_scored_pairs(list(zip(frame["userId"].tolist(), frame["movieId"].tolist())))
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "per_item_predictions.parquet"
@@ -217,7 +241,7 @@ def run_backend(
     return run.info.run_id, metrics
 
 
-def _parse_args() -> argparse.Namespace:
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Score one preference backend on the evaluation pairs.")
     parser.add_argument("--backend", required=True, choices=sorted(BACKEND_REGISTRY))
     parser.add_argument(
@@ -230,20 +254,28 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--item-selection", choices=["first", "random"], default=ITEM_SELECTION)
     parser.add_argument("--mlflow-uri", default=MLFLOW_URI)
-    return parser.parse_args()
+    parser.add_argument(
+        "--checkpoint", type=Path, default=None,
+        help="SASRec checkpoint from scripts/train_sasrec.py. Required for --backend sasrec.",
+    )
+    return parser.parse_args(argv)
 
 
-def main() -> None:
-    args = _parse_args()
+def main(argv: list[str] | None = None) -> None:
+    args = _parse_args(argv)
     reason = unavailable_reason(args.backend)
     if reason is not None:
         sys.exit(f"error: backend {args.backend!r} cannot be scored yet: {reason}")
+    if (args.backend == "sasrec") != (args.checkpoint is not None):
+        sys.exit("error: --checkpoint is required for, and only accepted with, --backend sasrec")
+    if args.checkpoint is not None and not args.checkpoint.is_file():
+        sys.exit(f"error: checkpoint {args.checkpoint} does not exist")
 
     cfg = dataclasses.replace(BASE_CONFIG, eval_user_frac=SWEEPS[args.sweep]["eval_user_frac"])
     max_items = args.max_items or None
     env = Environment(cfg)
     assignments = build_user_assignments(cfg, env, np.random.default_rng(cfg.random_seed))
-    backend = build_backend(args.backend, env)
+    backend = build_backend(args.backend, env, checkpoint=args.checkpoint)
     cap = f"{args.item_selection}{max_items}" if max_items else "all"
     run_id, metrics = run_backend(
         cfg, env, assignments, backend,

@@ -41,7 +41,12 @@ def _build_item_item(config: SimConfig, env: Environment) -> AbstractAgent:
 def _build_seq2seq(config: SimConfig, env: Environment) -> AbstractAgent:
     from sim.agents.seq2seq import Seq2SeqAgent
 
-    return Seq2SeqAgent(env)
+    if not config.sasrec_checkpoint_path:
+        raise ValueError(
+            "agent_type 'seq2seq' needs sasrec_checkpoint_path, a checkpoint "
+            "written by scripts/train_sasrec.py"
+        )
+    return Seq2SeqAgent(env, config.sasrec_checkpoint_path)
 
 
 def _build_llm(config: SimConfig, env: Environment) -> AbstractAgent:
