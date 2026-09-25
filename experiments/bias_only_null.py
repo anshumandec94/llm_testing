@@ -19,6 +19,22 @@ if the re-scored associative MAE does not match its published value, the
 null is being computed against a different bias model and the comparison is
 void, so the script refuses to continue.
 
+Issue #27 adds a third arm on the same pairs, `associative_residual`: the
+bias baseline plus an un-normalised TruncatedSVD of the debiased training
+residuals (`sim/residual_factors.py`), at the published arm's dimension. It
+is the rating-unit version of the associative prediction, and whether it
+beats the null is the question that issue asks.
+
+A fourth, `associative_als`, is a secondary diagnostic: the same residuals
+and dimension, fitted by ALS on observed cells only. The SVD treats the
+unobserved 99.8% of the matrix as zeros and is shrunk by them; the ALS shows
+how much of the SVD's small gain is that estimator rather than the
+representation. It is one untuned configuration, not a new baseline.
+
+Both residual arms are clipped to [1, 5], so their primary comparison is
+against the clamped null. The unclamped null is reported alongside. A
+dimension sweep over both is reported as a secondary table.
+
 Intervals cluster by user, the independent sampling unit. Per-item SEs
 understate them by about 25% here.
 
@@ -34,6 +50,7 @@ import dataclasses
 import json
 import logging
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 import numpy as np
@@ -41,9 +58,22 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from experiments.llm_vs_associative import BASE_CONFIG, score_associative, select_held_items
+from experiments.llm_vs_associative import (
+    BASE_CONFIG,
+    score_associative,
+    score_associative_residual,
+    select_held_items,
+)
 from sim.environment import Environment
 from sim.population import build_user_assignments
+from sim.residual_factors import (
+    ALS_ITERATIONS,
+    ALS_REGULARIZATION,
+    ResidualFactors,
+    fit_residual_als,
+    fit_residual_factors,
+    training_residuals,
+)
 from sim.user_agent import SimulatedUser
 
 logging.basicConfig(
@@ -83,6 +113,24 @@ ITEM_SELECTION = "first"
 # MLflow stores the published MAEs as float32-ish values rounded on logging;
 # anything within this is the same environment.
 REPRODUCTION_TOLERANCE = 1e-4
+# Secondary: residual-SVD dimensions beyond the published arm's 8. The primary
+# result stays at `user_pref_features` so capacity matches the published arm.
+RESIDUAL_DIM_SWEEP = (8, 32, 64)
+# ALS at k=8 only: the vectorised k=32 fit ran out of memory and swapped for
+# an hour on the development machine, so it is not cheap. A secondary sweep.
+ALS_DIM_SWEEP = (8,)
+# Rating-unit arms, both fitted on the debiased training residuals at the
+# published capacity. The SVD is the #27 deliverable; the ALS is a secondary
+# diagnostic of how much the SVD's zero-imputation shrinks it.
+# Each takes (training residual frame, k, seed). The frame is built once per
+# sweep and shared: rebuilding the ~30M-row frame and its sparse matrix for
+# every fit is what pushed the 2566-user run into swap.
+RESIDUAL_ARMS = {
+    "associative_residual": fit_residual_factors,
+    "associative_als": fit_residual_als,
+}
+# Training cells sampled for the in-sample scale check.
+IN_SAMPLE_CELLS = 500_000
 
 
 def score_bias_only(
@@ -178,12 +226,13 @@ def _check_reproduces(name: str, got: float, published: float | None) -> None:
     logger.info("%s reproduces: %.6f vs published %.6f", name, got, published)
 
 
-def _selection_robustness(env, assignments, users, cfg) -> dict:
-    """Associative minus null on the other item selections.
+def _selection_robustness(env, assignments, users, cfg, fitted: dict[str, ResidualFactors]) -> dict:
+    """Every associative arm minus the null on the other item selections.
 
     The published comparison is on each user's five most recent held-out
-    items. This checks the ordering of associative against the null is not an
-    artefact of that slice.
+    items. This checks the ordering of each arm against the null is not an
+    artefact of that slice. The published arm's keys stay at the top level
+    for continuity with #26; each rating-unit arm gets its own block.
     """
     out = {}
     for name, cap, selection in [("all", None, "first"), ("random-5", 5, "random")]:
@@ -191,16 +240,123 @@ def _selection_robustness(env, assignments, users, cfg) -> dict:
             env, assignments, cap, item_selection=selection,
             seed=cfg.random_seed, split=cfg.recommender_eval_split,
         )
+        frame["pred_null_clamped"] = frame["pred_null"].clip(1.0, 5.0)
         predicted, _, _ = score_associative(
             env, assignments, users,
             max_items_per_user=cap, item_selection=selection, seed=cfg.random_seed,
         )
         frame["pred_associative"] = predicted
-        out[name] = {
+        row = {
             "null_mae": clustered_mae(frame, "pred_null")["mae"],
+            "null_clamped_mae": clustered_mae(frame, "pred_null_clamped")["mae"],
             "associative_mae": clustered_mae(frame, "pred_associative")["mae"],
             **paired_difference(frame, "pred_associative", "pred_null"),
         }
+        for arm, factors in fitted.items():
+            _add_residual_arm(env, assignments, factors, frame, cap, selection, cfg.random_seed, f"pred_{arm}")
+            row[f"{arm}_mae"] = clustered_mae(frame, f"pred_{arm}")["mae"]
+            row[f"{arm}_minus_null_clamped"] = paired_difference(frame, f"pred_{arm}", "pred_null_clamped")
+            row[f"{arm}_minus_null"] = paired_difference(frame, f"pred_{arm}", "pred_null")
+            row[f"{arm}_term"] = _residual_term_diagnostics(factors, frame)
+        out[name] = row
+    return out
+
+
+def _add_residual_arm(
+    env, assignments, factors: ResidualFactors, frame: pd.DataFrame,
+    cap: int | None, selection: str, seed: int, column: str = "pred_associative_residual",
+) -> None:
+    """Score a rating-unit arm into `frame`, refusing if its pairs differ."""
+    predicted, actual, pairs = score_associative_residual(
+        env, assignments, factors,
+        max_items_per_user=cap, item_selection=selection, seed=seed,
+    )
+    if pairs != list(zip(frame["userId"], frame["movieId"])):
+        raise RuntimeError(f"null and {column} scored different pairs")
+    if not np.allclose(actual, frame["rating"]):
+        raise RuntimeError(f"null and {column} disagree on the actual ratings")
+    frame[column] = predicted
+
+
+def _residual_term_diagnostics(
+    factors: ResidualFactors, frame: pd.DataFrame, train: pd.DataFrame | None = None,
+) -> dict:
+    """The same diagnostics as `_dot_term_diagnostics`, for a rating-unit arm.
+
+    The term is `U[user] @ V[item]`, unclipped. A term in the right units has
+    `ls_scale` near 1: below 1 means it is too large or noisy, above 1 means
+    it is too timid (shrunk). `mean_term` near 0 says it adds no systematic
+    offset, which is what the published arm's +0.39 stars failed.
+
+    With `train`, the same scale and correlation are also measured in-sample
+    on a fixed random sample of training cells, which separates estimator
+    shrinkage (present in-sample) from a generalisation gap (held-out only).
+    """
+    terms = factors.residuals(frame["userId"].to_numpy(), frame["movieId"].to_numpy())
+    residual = (frame["rating"] - frame["pred_null"]).to_numpy()
+    covered = factors.covered(frame["userId"].to_numpy(), frame["movieId"].to_numpy())
+    out = {
+        "n_components": factors.n_components,
+        "pairs_without_factors": int((~covered).sum()),
+        "mean_term": float(terms.mean()),
+        "term_std": float(terms.std()),
+        "residual_std": float(residual.std()),
+        "corr_term_residual": float(np.corrcoef(terms[covered], residual[covered])[0, 1]),
+        "ls_scale": float(terms @ residual / (terms @ terms)),
+    }
+    if train is not None:
+        idx = np.random.default_rng(0).choice(
+            len(train), size=min(IN_SAMPLE_CELLS, len(train)), replace=False,
+        )
+        sample = train.iloc[idx]
+        t_in = factors.residuals(sample["userId"].to_numpy(), sample["movieId"].to_numpy())
+        y_in = sample["residual"].to_numpy()
+        out["in_sample_cells"] = int(len(sample))
+        out["in_sample_ls_scale"] = float(t_in @ y_in / (t_in @ t_in))
+        out["in_sample_corr"] = float(np.corrcoef(t_in, y_in)[0, 1])
+    return out
+
+
+def _residual_dimension_sweep(env, assignments, cfg, train: pd.DataFrame) -> dict:
+    """Secondary: both rating-unit arms at other dimensions, recent-5 and all.
+
+    Not the primary result, which is fixed at the published arm's capacity
+    so the comparison changes target and scale only. ALS is swept at k=8 only
+    because its memory grows with k squared; see ALS_DIM_SWEEP.
+    """
+    frames = {
+        name: score_bias_only(
+            env, assignments, cap, item_selection="first",
+            seed=cfg.random_seed, split=cfg.recommender_eval_split,
+        )
+        for name, cap in [("first-5", MAX_ITEMS), ("all", None)]
+    }
+    for frame in frames.values():
+        frame["pred_null_clamped"] = frame["pred_null"].clip(1.0, 5.0)
+    plan: list[tuple[str, int, Callable[[pd.DataFrame, int, int], ResidualFactors]]] = [
+        ("associative_residual", k, fit_residual_factors) for k in RESIDUAL_DIM_SWEEP
+    ]
+    plan += [("associative_als", k, fit_residual_als) for k in ALS_DIM_SWEEP]
+    out: dict[str, dict] = {}
+    for arm, k, fit in plan:
+        factors = fit(train, k, cfg.random_seed)
+        row: dict[str, dict] = {}
+        for name, frame in frames.items():
+            cap = MAX_ITEMS if name == "first-5" else None
+            _add_residual_arm(env, assignments, factors, frame, cap, "first", cfg.random_seed, "pred_arm")
+            row[name] = {
+                "mae": clustered_mae(frame, "pred_arm")["mae"],
+                "minus_null_clamped": paired_difference(frame, "pred_arm", "pred_null_clamped"),
+                "minus_null": paired_difference(frame, "pred_arm", "pred_null"),
+                "ls_scale": _residual_term_diagnostics(factors, frame)["ls_scale"],
+            }
+        # SVD keys keep their #27 names (`k8`); ALS keys are prefixed.
+        out[f"k{k}" if arm == "associative_residual" else f"als_k{k}"] = row
+        logger.info(
+            "%s k=%d: first-5 MAE %.4f (minus clamped null %+.4f), all %.4f (%+.4f)",
+            arm, k, row["first-5"]["mae"], row["first-5"]["minus_null_clamped"]["diff"],
+            row["all"]["mae"], row["all"]["minus_null_clamped"]["diff"],
+        )
     return out
 
 
@@ -258,6 +414,18 @@ def run_sweep(label: str, spec: dict) -> dict:
     frame["pred_null_clamped"] = frame["pred_null"].clip(1.0, 5.0)
     frame["pred_associative"] = assoc_pred
 
+    # Issue #27: the rating-unit arms, at the published capacity.
+    train = training_residuals(env)
+    k = cfg.user_pref_features
+    fitted = {arm: fit(train, k, cfg.random_seed) for arm, fit in RESIDUAL_ARMS.items()}
+    for arm, factors in fitted.items():
+        _add_residual_arm(
+            env, assignments, factors, frame, MAX_ITEMS, ITEM_SELECTION, cfg.random_seed, f"pred_{arm}",
+        )
+    users_col, items_col = frame["userId"].to_numpy(), frame["movieId"].to_numpy()
+    frame["residual_term"] = fitted["associative_residual"].residuals(users_col, items_col)
+    frame["als_term"] = fitted["associative_als"].residuals(users_col, items_col)
+
     null = clustered_mae(frame, "pred_null")
     null_clamped = clustered_mae(frame, "pred_null_clamped")
     assoc = clustered_mae(frame, "pred_associative")
@@ -282,8 +450,43 @@ def run_sweep(label: str, spec: dict) -> dict:
         "associative_capped": assoc,
         "associative_minus_null": paired_difference(frame, "pred_associative", "pred_null"),
         "llm_arms": llm_rows,
-        "associative_minus_null_by_selection": _selection_robustness(env, assignments, users, cfg),
+        "associative_minus_null_clamped": paired_difference(
+            frame, "pred_associative", "pred_null_clamped"
+        ),
+        "associative_minus_null_by_selection": _selection_robustness(
+            env, assignments, users, cfg, fitted
+        ),
         "dot_term": _dot_term_diagnostics(env, assignments, users, frame),
+        # The rating-unit arms are clipped, so the clamped null is their
+        # primary comparison; the unclamped one is kept alongside.
+        "associative_residual_capped": clustered_mae(frame, "pred_associative_residual"),
+        "associative_residual_minus_null_clamped": paired_difference(
+            frame, "pred_associative_residual", "pred_null_clamped"
+        ),
+        "associative_residual_minus_null": paired_difference(
+            frame, "pred_associative_residual", "pred_null"
+        ),
+        "associative_residual_minus_associative": paired_difference(
+            frame, "pred_associative_residual", "pred_associative"
+        ),
+        "residual_term": _residual_term_diagnostics(fitted["associative_residual"], frame, train),
+        "associative_als_secondary": {
+            "config": {
+                "n_components": fitted["associative_als"].n_components,
+                "regularization": ALS_REGULARIZATION,
+                "iterations": ALS_ITERATIONS,
+                "random_state": cfg.random_seed,
+                "tuned": False,
+            },
+            "capped": clustered_mae(frame, "pred_associative_als"),
+            "minus_null_clamped": paired_difference(frame, "pred_associative_als", "pred_null_clamped"),
+            "minus_null": paired_difference(frame, "pred_associative_als", "pred_null"),
+            "minus_associative_residual": paired_difference(
+                frame, "pred_associative_als", "pred_associative_residual"
+            ),
+            "term": _residual_term_diagnostics(fitted["associative_als"], frame, train),
+        },
+        "residual_dimension_sweep_secondary": _residual_dimension_sweep(env, assignments, cfg, train),
         "out_of_range_null_predictions": int(
             ((frame["pred_null"] < 1.0) | (frame["pred_null"] > 5.0)).sum()
         ),
