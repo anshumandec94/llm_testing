@@ -60,6 +60,7 @@ from sim.agents.sasrec_data import (  # noqa: E402
     resolve_window_stride,
 )
 from sim.agents.sasrec_model import SASRec, SasrecLosses  # noqa: E402
+from sim.agents.seq2seq import load_sasrec_checkpoint  # noqa: E402
 from sim.config import SimConfig  # noqa: E402
 from sim.environment import Environment  # noqa: E402
 
@@ -309,11 +310,7 @@ def save_checkpoint(
 
 def load_checkpoint(path: Path, device: torch.device | str = "cpu") -> tuple[SASRec, dict]:
     """Rebuild the model from a checkpoint. Returns ``(model, payload)``."""
-    payload = torch.load(path, map_location=device, weights_only=False)
-    config = SimConfig.from_dict(payload["config"])
-    model = SASRec.from_config(config, item_num=len(payload["index_to_item"]) - 1)
-    model.load_state_dict(payload["model_state"])
-    return model.to(device), payload
+    return load_sasrec_checkpoint(path, device)
 
 
 def _check_resumable(payload: dict, config: SimConfig, args: TrainingArgs) -> None:

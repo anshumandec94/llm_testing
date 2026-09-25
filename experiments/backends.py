@@ -27,6 +27,7 @@ backend returns the unclipped residual.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, cast, runtime_checkable
 
 import numpy as np
@@ -37,6 +38,7 @@ from sim.residual_factors import ResidualFactors
 
 if TYPE_CHECKING:
     from sim.agents.base import AbstractAgent
+    from sim.agents.seq2seq import Seq2SeqAgent
     from sim.persona import AgentPersona
 
 
@@ -183,15 +185,41 @@ _NOT_RATING_UNITS = (
 
 
 class SASRecBackend:
-    """Registration point for SASRec's rating head; issue #19 fills it."""
+    """SASRec's rating head, through `Seq2SeqAgent` (issue #19).
+
+    The rating head is trained by MSE against `env.debias_rating` residuals,
+    so its output is already this module's unit and is passed through as is.
+    Context is each user's most recent `maxlen` training interactions
+    (`padded_sequence`), never the training windows. nan for an item outside
+    the vocabulary or a user with no training history; see
+    `sim/agents/seq2seq.py`, which also refuses a checkpoint trained on a
+    different split or `maxlen`.
+    """
 
     name = "sasrec"
 
-    def __init__(self, *args, **kwargs) -> None:
-        raise NotImplementedError("SASRecBackend is filled by issue #19.")
+    def __init__(self, agent: Seq2SeqAgent) -> None:
+        self.agent = agent
+
+    @classmethod
+    def from_checkpoint(cls, env: Environment, checkpoint_path: str | Path) -> SASRecBackend:
+        from sim.agents.seq2seq import Seq2SeqAgent
+
+        return cls(Seq2SeqAgent(env, checkpoint_path))
 
     def predict(self, user_id: int, item_ids: list[int]) -> np.ndarray:
-        raise NotImplementedError("SASRecBackend is filled by issue #19.")
+        return self.agent.predict_residuals(int(user_id), [int(i) for i in item_ids])
+
+    def describe(self) -> tuple[dict[str, object], dict[str, object]]:
+        """(MLflow params, the checkpoint's saved config) so a run describes its model."""
+        params: dict[str, object] = {
+            "sasrec_checkpoint": str(self.agent.checkpoint_path.resolve()),
+            "sasrec_checkpoint_epoch": self.agent.epoch,
+            "sasrec_residual_std": self.agent.residual_std,
+        }
+        trained = self.agent.trained_config.as_dict()
+        params.update({f"ckpt_{k}": v for k, v in trained.items() if k.startswith("sasrec_")})
+        return params, self.agent.trained_config.to_json_dict()
 
 
 # Every arm the harness can name, keyed by `name`. Construction arguments

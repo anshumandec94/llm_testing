@@ -146,10 +146,10 @@ class TestMetrics:
 
 class TestCli:
 
-    @pytest.mark.parametrize("name", ["residual_profile", "item_item", "sasrec"])
+    @pytest.mark.parametrize("name", ["residual_profile", "item_item"])
     def test_stub_backends_are_refused(self, name):
         assert unavailable_reason(name)
 
-    @pytest.mark.parametrize("name", ["bias_only", "associative", "llm"])
+    @pytest.mark.parametrize("name", ["bias_only", "associative", "llm", "sasrec"])
     def test_buildable_backends_are_allowed(self, name):
         assert unavailable_reason(name) is None

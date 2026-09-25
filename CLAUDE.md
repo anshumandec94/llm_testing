@@ -54,7 +54,7 @@ Always use `uv` / `uv run`. Never bare `python` or `pip`.
 | `residual_profile.py` | Implemented - weighted residual item profile |
 | `item_item.py` | Implemented - item-item neighborhood scoring |
 | `semantic.py` | Stub - raises `NotImplementedError` |
-| `seq2seq.py` | Stub - raises `NotImplementedError` |
+| `seq2seq.py` | Implemented - SASRec rating head from a `scripts/train_sasrec.py` checkpoint |
 | `llm.py` | Implemented - local LLM rating prediction via `mlx-lm` |
 
 New agents must be registered in `AGENT_REGISTRY` in `sim/agents/__init__.py`.

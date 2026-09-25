@@ -155,6 +155,9 @@ class SimConfig:
     sasrec_inject_rating: bool = True
     # Hidden width of the rating head MLP.
     sasrec_rating_head_hidden: int = 64
+    # Checkpoint written by scripts/train_sasrec.py that the "seq2seq" agent
+    # scores. Required for that agent; unused otherwise.
+    sasrec_checkpoint_path: str | None = None
 
     def __post_init__(self) -> None:
         # Imported here, not at module level: sim.agents pulls in LensKit and
@@ -217,6 +220,7 @@ class SimConfig:
             "sasrec_rating_loss_weight": self.sasrec_rating_loss_weight,
             "sasrec_inject_rating": self.sasrec_inject_rating,
             "sasrec_rating_head_hidden": self.sasrec_rating_head_hidden,
+            "sasrec_checkpoint_path": str(self.sasrec_checkpoint_path),
         }
 
     def to_json_dict(self) -> dict:

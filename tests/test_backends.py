@@ -21,7 +21,6 @@ from experiments.backends import (
     LLMBackend,
     PreferenceBackend,
     ResidualProfileBackend,
-    SASRecBackend,
 )
 from experiments.bias_only_null import score_bias_only
 from experiments.llm_vs_associative import score_associative_residual
@@ -167,7 +166,7 @@ class TestLLM:
         np.testing.assert_allclose(out, expected, atol=1e-6)
 
 
-@pytest.mark.parametrize("cls", [ResidualProfileBackend, ItemItemBackend, SASRecBackend])
+@pytest.mark.parametrize("cls", [ResidualProfileBackend, ItemItemBackend])
 def test_unfilled_arms_refuse_to_construct(cls, env):
     with pytest.raises(NotImplementedError):
         cls(env)
