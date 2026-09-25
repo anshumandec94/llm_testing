@@ -23,6 +23,11 @@ from lenskit.data import ItemList
 
 from sim.agents.llm import LLMAgent
 
+# mlx-lm is only installed on macOS (see the sys_platform marker in
+# pyproject.toml). The fixtures patch mlx_lm.load, which imports mlx_lm,
+# so skip the whole module where it cannot be imported.
+pytest.importorskip("mlx_lm")
+
 
 # ── Shared fixtures ───────────────────────────────────────────────────────────
 
