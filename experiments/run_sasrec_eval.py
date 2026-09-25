@@ -28,10 +28,13 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import sys
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from experiments import compare_backends
 from experiments.bias_only_null import ITEM_SELECTION, MAX_ITEMS
