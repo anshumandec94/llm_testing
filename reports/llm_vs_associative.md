@@ -2,12 +2,20 @@
 
 Experiment: `llm-agent-comparison` (`sqlite:///mlflow.db`)
 Script: `experiments/llm_vs_associative.py`
-LLM arms run 2026-06-26. Corrected baselines run 2026-08-25.
-Last updated: 2026-08-25
+LLM arms run 2026-06-26. Corrected baselines run 2026-08-25. Bias-only null run 2026-09-24.
+Last updated: 2026-09-24
 
 ---
 
 ## Summary
+
+> **Read this first (2026-09-24).**
+> A bias-only null, which predicts `global + user + item bias` and nothing else, beats **every** arm in this report, the associative baseline included.
+> On the matched recent-5 pairs it scores 0.7359 MAE at 128 users and 0.6951 at 2566 users.
+> So the honest reading is not "the associative baseline beats the LLM" but "neither arm adds anything over a bias table, and both are worse than one".
+> The associative arm loses because its dot term is on the wrong scale and adds a systematic +0.39 stars, not because latent factors are uninformative.
+> See [The bias-only null](#the-bias-only-null) below.
+> The comparisons further down are still correct as comparisons between those arms; what changed is what they mean.
 
 Five LLM prompt variants and an associative latent-factor baseline were asked the same question: given a user's rating history, predict the rating they gave to a held-out movie.
 
@@ -132,6 +140,102 @@ It is 128 users and 640 items, and the differences being chased are an order of 
 
 ---
 
+## The bias-only null
+
+Script: `experiments/bias_only_null.py`.
+Per-item predictions and the full summary: `reports/bias_only_null/`.
+
+The null predicts `env.get_rating_bias(uid, mid)` for every pair, a debiased residual of exactly zero.
+It models no user-item interaction, so an arm that does not beat it is reproducing a lookup table rather than representing preference.
+
+It is scored on exactly the published pairs, through `select_held_items` with `--max-items 5 --item-selection first`.
+The script re-scores the associative arm in the same rebuilt environment and refuses to continue unless it reproduces the published MLflow values to 1e-4.
+All three did, exactly: 0.704546 and 0.791589 at 128 users, 0.719526 at 2566 users.
+So the null is computed against the same bias model the published arms used.
+
+Intervals are 95%, clustered by user.
+With every user at the five-item cap, the item micro-average and the user-weighted mean are identical.
+
+### Does each published arm beat the null?
+
+| Arm | Users | MAE | Arm minus null | Beats the null? |
+|---|---|---|---|---|
+| **bias-only null** | 128 | **0.7359** (0.670 to 0.802) | | |
+| associative-baseline-capped | 128 | 0.7916 | +0.056, paired CI 0.017 to 0.095, t = 2.8 | **No, worse** |
+| llm-top_rated-k2 | 128 | 0.9136 | +0.178 | **No, worse** |
+| llm-recent-k3 | 128 | 0.9161 | +0.180 | **No, worse** |
+| llm-top_rated-k5 | 128 | 0.9331 | +0.197 | **No, worse** |
+| llm-polarized-k3-no-fewshot | 128 | 0.9391 | +0.203 | **No, worse** |
+| llm-polarized-k2 | 128 | 0.9852 | +0.249 | **No, worse** |
+| **bias-only null** | 2566 | **0.6951** (0.681 to 0.710) | | |
+| associative, re-scored capped | 2566 | 0.7415 | +0.046, paired CI 0.037 to 0.055, t = 10.0 | **No, worse** |
+| llm-top_rated-k2 | 2566 | 0.8934 | +0.198 | **No, worse** |
+
+No arm beats the null, at either scale.
+
+The associative rows are paired tests on identical pairs.
+The LLM rows cannot be paired, because the 2026-06-26 runs logged aggregates only, so they are read against the null's own interval.
+The smallest LLM gap, 0.178 at 128 users, is 5.3 null standard errors; at 2566 users the gap is 0.198 against a null SE of 0.0074.
+Even allowing the LLM arm an interval as wide again as the null's, neither is close.
+
+The 2566-user associative row is new.
+That sweep's baseline was never re-scored capped, and this is the first matched number for it: 0.7415 on the same 12830 pairs as the LLM arm.
+
+Clamping the null to `[1, 5]` changes nothing material: 0.7350 and 0.6938, against unclamped 0.7359 and 0.6951.
+Unclamped is primary because the benchmark measures debiased residuals.
+Only 4 of 640 and 54 of 12830 null predictions fall outside the range.
+
+### It is not an artefact of the recent-5 slice
+
+Associative minus null, paired by user, on the other selections:
+
+| Users | Selection | Null | Associative | Difference | t |
+|---|---|---|---|---|---|
+| 128 | all held-out | 0.6579 | 0.7045 | +0.043 | 3.1 |
+| 128 | random-5 | 0.7037 | 0.7449 | +0.041 | 2.2 |
+| 2566 | all held-out | 0.6524 | 0.7195 | +0.057 | 17.0 |
+| 2566 | random-5 | 0.6744 | 0.7382 | +0.064 | 14.1 |
+
+The associative arm is worse than the null on every selection.
+The uncapped `associative-baseline` at 0.7045, the lowest MAE in the original table, loses to the null on the same 5659 items, which scores 0.6579.
+
+### Why the associative arm loses: its dot term is in the wrong units
+
+The associative prediction is `bias + dot(pref_vector, item_factor)`.
+It can only lose to `bias` alone if the dot term hurts more than it helps, and it does, for a reason that is structural rather than statistical.
+
+The preference space is a `TruncatedSVD` fitted on **raw** training ratings, not debiased residuals (`sim/environment.py`, `_setup_user_pref_embeddings`), and both sides are L2-normalised.
+So the dot term is a cosine similarity in `[-1, 1]`, not a rating residual.
+Raw ratings are all positive, so the leading singular direction is shared by everyone and the cosine is positive almost everywhere.
+
+Measured on the recent-5 pairs:
+
+| | 128 users | 2566 users |
+|---|---|---|
+| Mean of associative minus null prediction | +0.402 | +0.384 |
+| Share of pairs where it is positive | 96.6% | 94.7% |
+| Mean signed error, null | +0.007 | -0.030 |
+| Mean signed error, associative | +0.409 | +0.355 |
+| Correlation of dot term with the true residual | 0.021 | 0.068 |
+| Least-squares scale of the dot term | 0.008 | 0.125 |
+
+The null is unbiased.
+The associative arm over-predicts by about 0.4 stars, and the dot term carries almost no information about the residual it is added to.
+A correctly-scaled term would have a least-squares coefficient near 1.
+
+This contradicts the module docstring of `experiments/llm_vs_associative.py`, which describes `bias + dot` as "the same decomposition the model was fitted on".
+It is not: the bias model and the SVD were fitted separately, on different targets.
+It is a live example of the project's known trap that the associative and LLM agents return different units from the same interface.
+
+### What this changes
+
+- **The headline.** "The associative baseline beats every LLM arm by 0.122 MAE" is still true as a statement about those two arms. But both are worse than a bias table, so it does not say that latent factors beat content-based LLM prediction. It says a miscalibrated latent-factor arm beats a worse LLM arm.
+- **The LLM result.** The LLM arms are 0.18 to 0.25 MAE worse than the null. Given `k` rated examples, Qwen2.5-7B predicts ratings worse than the user's and item's average ratings do. That is the cleanest finding in this report.
+- **The floor for SASRec and every later backend is the null, not associative.** An arm has to beat 0.6951 at 2566 users, first-5, to show it represents preference at all.
+- **The associative arm needs fixing before it is used as a baseline again.** That is issue #27, kept separate because the same preference space drives the simulation's personas.
+
+---
+
 ## A second sweep exists
 
 The `llm-agent-comparison` experiment also holds an earlier, larger sweep at `eval_user_frac=0.02`, 2566 users.
@@ -145,8 +249,10 @@ It is excluded from the headline result for two reasons.
 It carries the identical item-count confound, `12830 = 2566 x 5` against an uncapped baseline, and it has not been re-scored.
 More importantly only one LLM arm ever ran at that scale, so it cannot rank variants and cannot support the prompt-strategy question this experiment exists to ask.
 
+Its baseline has now been re-scored on the matched pairs, as part of the bias-only null run: 0.7415 on the same 12830 pairs as the LLM arm, a gap of 0.152.
+See [The bias-only null](#the-bias-only-null).
+
 It is worth noting that it points the same way, and on 20x the users, which is mild independent support for the direction of the headline result.
-Re-scoring its baseline with `--baseline-only --max-items 5` would make it directly quotable and costs one environment build.
 
 ---
 
@@ -164,6 +270,10 @@ Re-scoring its baseline with `--baseline-only --max-items 5` would make it direc
 ## Reproducing
 
 ```bash
+# Bias-only null on both published sweeps, with the associative re-score,
+# selection robustness and dot-term diagnostics. About a minute.
+uv run python experiments/bias_only_null.py
+
 # Capped baseline, matched to the LLM arms. No LLM calls, about 15 s on a warm
 # embedding cache.
 uv run python experiments/llm_vs_associative.py --baseline-only --max-items 5
