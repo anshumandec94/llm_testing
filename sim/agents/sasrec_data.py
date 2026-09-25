@@ -25,6 +25,19 @@ rather than assumed:
 Index 0 is reserved for padding and never names a real item. Sequences are
 left-padded, so the most recent interaction is always the last position.
 
+Training and inference see a long history differently, on purpose:
+
+* **Inference** (``padded_sequence`` / ``padded_matrix``) uses only the user's
+  most recent ``maxlen`` interactions, because that is the context the model
+  actually has at prediction time.
+* **Training** (``training_window_index`` / ``training_batch``) cuts the whole
+  history into contiguous windows, so a user with 1,000 interactions
+  contributes all of them rather than their last ``maxlen``. At ML-32M and
+  ``maxlen=200`` the single-tail approach discards 39% of the training data
+  (issue #24). This is safe only because the port has no user embedding: a
+  user is nothing but a sequence, so splitting one history into several
+  windows fragments no identity.
+
 Alongside each item the sequence carries that interaction's debiased residual
 (``rating - (global_bias + user_bias + item_bias)``, from LensKit's damped
 ``BiasModel``), and the whole dataset carries the train-set standard deviation of
@@ -47,6 +60,108 @@ PAD_SENTINEL_ID = -1
 
 # pmixer/SASRec.pytorch uses maxlen=200 for MovieLens-1M.
 DEFAULT_MAXLEN = 200
+
+
+def resolve_window_stride(
+    stride: int | np.integer | None, maxlen: int | np.integer
+) -> int:
+    """
+    Effective training-window stride.
+
+    ``None`` means "equal to ``maxlen``", which gives disjoint windows that
+    make every interaction a target exactly once. ``0`` is rejected rather than
+    treated as a second spelling of that default, so a zero that arrives by
+    accident fails loudly. A stride above ``maxlen`` is rejected too: it would
+    leave gaps between windows and silently discard interactions, which is the
+    exact problem windowing exists to fix.
+
+    Both arguments must be real integers. ``2.5`` would otherwise truncate and
+    ``True`` would pass as ``1``, and either is far more likely a config typo
+    than an intended stride.
+    """
+    for name, value in (("maxlen", maxlen), ("window stride", stride)):
+        if value is not None and (
+            isinstance(value, (bool, np.bool_))
+            or not isinstance(value, (int, np.integer))
+        ):
+            raise TypeError(f"{name} must be an int, got {value!r}")
+    if maxlen < 1:
+        raise ValueError(f"training windows need maxlen >= 1, got {maxlen}")
+    if stride is None:
+        return int(maxlen)
+    if not 1 <= stride <= maxlen:
+        raise ValueError(
+            f"window stride must be in [1, maxlen={maxlen}], got {stride}; "
+            f"use None for stride = maxlen"
+        )
+    return int(stride)
+
+
+@dataclass
+class SasrecTrainingBatch:
+    """
+    Materialised training windows, one row per window.
+
+    ``target_items[:, t]`` is the item that follows ``input_items[:, t]`` in
+    the user's history, which is the shift ``SASRec.forward`` and
+    ``SASRec.losses`` expect. Both are left-padded with ``PAD_INDEX``, and a
+    padded target contributes nothing to the loss. Negatives are not sampled
+    here; that is the training loop's job.
+    """
+
+    input_items: np.ndarray
+    """``(n_windows, maxlen)`` int32 item indices fed to the model."""
+
+    input_residuals: np.ndarray
+    """``(n_windows, maxlen)`` float32 residuals of the input positions."""
+
+    target_items: np.ndarray
+    """``(n_windows, maxlen)`` int32 next-item targets."""
+
+    target_residuals: np.ndarray
+    """``(n_windows, maxlen)`` float32 residuals of the targets. Labels only."""
+
+    user_ids: np.ndarray
+    """``(n_windows,)`` owning userId per row. Diagnostic only; the model takes no user input."""
+
+
+@dataclass(frozen=True)
+class SasrecWindowIndex:
+    """
+    Training windows, enumerated but not materialised.
+
+    Carries the ``maxlen`` and stride the rows were built with, so
+    ``training_batch`` cannot materialise them at a different width. A batch
+    narrower than its index would silently drop the oldest part of every
+    window, which no shape check downstream would catch.
+
+    Index with ``[]`` (a slice, an integer array from a shuffle, a mask) to
+    take a mini-batch; the result keeps the same ``maxlen`` and stride.
+    """
+
+    rows: np.ndarray
+    """``(n_windows, 2)`` int64 ``(userId, target_end)`` rows."""
+
+    maxlen: int
+    stride: int
+
+    def __len__(self) -> int:
+        return len(self.rows)
+
+    def __getitem__(self, key) -> "SasrecWindowIndex":
+        return SasrecWindowIndex(
+            rows=self.rows[key].reshape(-1, 2),
+            maxlen=self.maxlen,
+            stride=self.stride,
+        )
+
+    @property
+    def user_ids(self) -> np.ndarray:
+        return self.rows[:, 0]
+
+    @property
+    def target_ends(self) -> np.ndarray:
+        return self.rows[:, 1]
 
 
 @dataclass
@@ -78,7 +193,13 @@ class SasrecSequenceData:
     """Population standard deviation of the residuals over all training interactions."""
 
     maxlen: int
-    """Sequence length the padding helpers emit."""
+    """Sequence length the padding helpers and training windows emit."""
+
+    window_stride: int | None = None
+    """
+    Default stride for ``training_window_index``. ``None`` means ``maxlen``
+    (disjoint windows); see ``resolve_window_stride``.
+    """
 
     @property
     def vocab_size(self) -> int:
@@ -87,6 +208,10 @@ class SasrecSequenceData:
 
     @property
     def num_users(self) -> int:
+        """
+        Users, not training rows. Once windowed, one user may contribute many
+        training rows; count those with ``len(training_window_index())``.
+        """
         return len(self.user_sequences)
 
     def item_index(self, movie_id: int) -> int:
@@ -158,6 +283,114 @@ class SasrecSequenceData:
             items[row], residuals[row] = self.padded_sequence(uid, length)
         return items, residuals, ids
 
+    def training_window_index(
+        self,
+        maxlen: int | None = None,
+        stride: int | None = None,
+        user_ids: list[int] | None = None,
+    ) -> SasrecWindowIndex:
+        """
+        Enumerate the training windows without materialising them.
+
+        Returns a ``SasrecWindowIndex`` of ``(userId, target_end)`` rows that
+        remembers this ``maxlen`` and stride. A window's targets are the user's
+        positions ``[max(1, target_end - maxlen), target_end)`` and its inputs
+        are the same range shifted back by one, so every window is a
+        contiguous, timestamp-ascending "predict the next item" problem. Pass
+        the index (all of it, or a shuffled mini-batch of it) to
+        ``training_batch``.
+
+        Rows follow ``user_ids`` order, sorted userIds by default. As with
+        ``padded_matrix``, a userId listed twice is enumerated twice, so its
+        windows appear twice; deduplicate first if that is not wanted. Unknown
+        userIds are skipped.
+
+        **Anchoring.** Windows are anchored at the most recent end:
+        ``target_end`` runs ``L, L - stride, L - 2 * stride, ...`` for a
+        sequence of length ``L``. The newest window is therefore exactly the
+        single example pmixer's sampler builds (targets are the last ``maxlen``
+        interactions, inputs the ``maxlen`` before each), so the pre-windowing
+        training set is a strict subset of this one. The oldest window holds
+        the short remainder and is left-padded like any short user.
+        Enumeration stops at the first window that reaches the start of the
+        history, because every older window would be a prefix of it.
+
+        With the default ``stride == maxlen`` the target ranges partition
+        ``[1, L)``: every interaction except the user's first is a target
+        exactly once. A smaller stride overlaps windows and oversamples heavy
+        users. A user with fewer than two interactions has no next-item target
+        and yields no window, matching pmixer's sampler.
+
+        Training only. Inference must keep using ``padded_sequence``, which
+        sees the most recent ``maxlen`` interactions and nothing else.
+        """
+        length = self.maxlen if maxlen is None else maxlen
+        step = resolve_window_stride(
+            self.window_stride if stride is None else stride, length
+        )
+        ids = sorted(self.user_sequences) if user_ids is None else [int(u) for u in user_ids]
+
+        rows: list[tuple[int, int]] = []
+        for uid in ids:
+            seq = self.user_sequences.get(uid)
+            if seq is None:
+                continue
+            end = len(seq)
+            while end >= 2:
+                rows.append((uid, end))
+                if end - length <= 1:
+                    break
+                end -= step
+        return SasrecWindowIndex(
+            rows=np.array(rows, dtype=np.int64).reshape(-1, 2),
+            maxlen=int(length),
+            stride=step,
+        )
+
+    def training_batch(self, windows: SasrecWindowIndex) -> SasrecTrainingBatch:
+        """
+        Materialise a ``SasrecWindowIndex`` into padded arrays.
+
+        Kept separate from the index so a training loop can shuffle and batch
+        windows without holding every window of ML-32M in memory at once. The
+        width is the index's own ``maxlen`` and cannot be overridden here, so a
+        batch always holds whole windows.
+        """
+        if not isinstance(windows, SasrecWindowIndex):
+            raise TypeError(
+                "training_batch takes a SasrecWindowIndex from "
+                f"training_window_index, got {type(windows).__name__}"
+            )
+        length = windows.maxlen
+        n = len(windows)
+        input_items = np.zeros((n, length), dtype=np.int32)
+        input_residuals = np.zeros((n, length), dtype=np.float32)
+        target_items = np.zeros((n, length), dtype=np.int32)
+        target_residuals = np.zeros((n, length), dtype=np.float32)
+
+        for row, (uid, end) in enumerate(windows.rows.tolist()):
+            seq = self.user_sequences[uid]
+            res = self.user_residuals[uid]
+            if not 2 <= end <= len(seq):
+                raise ValueError(
+                    f"window end {end} is out of range for user {uid} "
+                    f"with {len(seq)} interactions"
+                )
+            start = max(1, end - length)
+            width = end - start
+            target_items[row, length - width :] = seq[start:end]
+            target_residuals[row, length - width :] = res[start:end]
+            input_items[row, length - width :] = seq[start - 1 : end - 1]
+            input_residuals[row, length - width :] = res[start - 1 : end - 1]
+
+        return SasrecTrainingBatch(
+            input_items=input_items,
+            input_residuals=input_residuals,
+            target_items=target_items,
+            target_residuals=target_residuals,
+            user_ids=windows.user_ids.copy(),
+        )
+
 
 def build_item_vocabulary(all_ratings: pd.DataFrame) -> tuple[dict[int, int], list[int]]:
     """
@@ -173,14 +406,21 @@ def build_item_vocabulary(all_ratings: pd.DataFrame) -> tuple[dict[int, int], li
     return item_to_index, index_to_item
 
 
-def build_sasrec_sequences(env, maxlen: int = DEFAULT_MAXLEN) -> SasrecSequenceData:
+def build_sasrec_sequences(
+    env, maxlen: int = DEFAULT_MAXLEN, window_stride: int | None = None
+) -> SasrecSequenceData:
     """
     Build SASRec training sequences from ``env.train_ratings``.
 
     All users are included; there is no ``min_ratings`` filter, because the
     benchmark scores every eval user and a filtered training set would quietly
     change which users the arm can represent.
+
+    ``window_stride`` becomes the default for ``training_window_index``. It is
+    validated here, so a bad ``SimConfig`` fails before the expensive build
+    rather than at the first training batch.
     """
+    resolve_window_stride(window_stride, maxlen)
     item_to_index, index_to_item = build_item_vocabulary(env.all_ratings)
 
     train = env.train_ratings
@@ -244,4 +484,5 @@ def build_sasrec_sequences(env, maxlen: int = DEFAULT_MAXLEN) -> SasrecSequenceD
         user_residuals=user_residuals,
         residual_std=residual_std,
         maxlen=maxlen,
+        window_stride=window_stride,
     )
