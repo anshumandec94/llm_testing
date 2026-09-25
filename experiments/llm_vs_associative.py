@@ -5,11 +5,21 @@ Each held-out user is evaluated by BOTH agent types on their held-out items.
 The metric is rating prediction error — how close is the agent's predicted
 rating to the rating the user actually gave?
 
-AssociativeAgent prediction:
+AssociativeAgent prediction (the published arm):
     predicted = env.get_rating_bias(uid, mid) + dot(pref_vector, item_factor)
-    This reconstructs a full rating from the bias baseline (global + user +
-    item bias) and the residual preference signal from TruncatedSVD — the
-    same decomposition the model was fitted on.
+    This adds the persona preference-space dot product to the bias baseline
+    (global + user + item bias). It is NOT a fitted decomposition: the bias
+    model and the SVD were fitted separately and on different targets. The
+    SVD is fitted on RAW ratings and both sides are L2-normalised, so the dot
+    is a cosine in [-1, 1], not a residual in stars, and on average it adds
+    about +0.4 stars. It loses to the bias term alone (issue #26) and is kept
+    unchanged only so the 2026-06-26 runs stay reproducible.
+
+Residual associative prediction (issue #27, `score_associative_residual`):
+    predicted = env.get_rating_bias(uid, mid) + U[uid] @ V[mid]
+    where U and V come from a separate, un-normalised TruncatedSVD fitted on
+    debiased training residuals (`sim/residual_factors.py`). This is the
+    decomposition the prediction actually uses, in rating units.
 
 LLM prediction:
     The LLM receives k examples of movies the user has rated (with title,
@@ -53,6 +63,7 @@ from sim.agents.llm import LLMAgent
 from sim.config import SimConfig
 from sim.environment import Environment
 from sim.population import build_user_assignments
+from sim.residual_factors import ResidualFactors
 from sim.user_agent import SimulatedUser
 
 logging.basicConfig(
@@ -230,6 +241,51 @@ def score_associative(
             dot = float(np.dot(persona.pref_vector, item_factors[mid])) if mid in item_factors else 0.0
             pred = float(np.clip(bias + dot, 1.0, 5.0))
             all_predicted.append(pred)
+            all_actual.append(actual_by_id[mid])
+            pairs.append((base_uid, mid))
+
+    return all_predicted, all_actual, pairs
+
+
+def score_associative_residual(
+    env: Environment,
+    assignments,
+    factors: ResidualFactors,
+    max_items_per_user: int | None = None,
+    item_selection: str = "first",
+    seed: int | None = None,
+) -> tuple[list[float], list[float], list[tuple[int, int]]]:
+    """Score every selected held-out item with bias + residual SVD.
+
+    The rating-unit fix for the associative arm (issue #27). Items are chosen
+    through `select_held_items` exactly as in `score_associative`, so the two
+    return identical pairs for the same cap, selection and seed. Predictions
+    are clipped to [1, 5] as the published arm's are. Returns
+    (predicted, actual, pairs).
+    """
+    cfg = BASE_CONFIG
+    if seed is None:
+        seed = cfg.random_seed
+    all_predicted: list[float] = []
+    all_actual: list[float] = []
+    pairs: list[tuple[int, int]] = []
+
+    for assignment in assignments:
+        base_uid = assignment.base_user_id
+        held_out_df = env.held_out_for_user(base_uid, split=cfg.recommender_eval_split)
+        if held_out_df.empty:
+            continue
+        held_ids = select_held_items(
+            held_out_df, max_items_per_user,
+            selection=item_selection, user_id=base_uid, seed=seed,
+        )
+        actual_by_id = {
+            int(mid): float(r)
+            for mid, r in zip(held_out_df["movieId"], held_out_df["rating"])
+        }
+        for mid in held_ids:
+            pred = env.get_rating_bias(base_uid, mid) + factors.residual(base_uid, mid)
+            all_predicted.append(float(np.clip(pred, 1.0, 5.0)))
             all_actual.append(actual_by_id[mid])
             pairs.append((base_uid, mid))
 

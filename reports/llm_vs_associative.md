@@ -2,7 +2,7 @@
 
 Experiment: `llm-agent-comparison` (`sqlite:///mlflow.db`)
 Script: `experiments/llm_vs_associative.py`
-LLM arms run 2026-06-26. Corrected baselines run 2026-08-25. Bias-only null run 2026-09-24.
+LLM arms run 2026-06-26. Corrected baselines run 2026-08-25. Bias-only null and rating-unit associative arm run 2026-09-24.
 Last updated: 2026-09-24
 
 ---
@@ -15,6 +15,13 @@ Last updated: 2026-09-24
 > So the honest reading is not "the associative baseline beats the LLM" but "neither arm adds anything over a bias table, and both are worse than one".
 > The associative arm loses because its dot term is on the wrong scale and adds a systematic +0.39 stars, not because latent factors are uninformative.
 > See [The bias-only null](#the-bias-only-null) below.
+>
+> **Fixed (issue #27).** An associative arm in rating units, `bias + U @ V` from an un-normalised 8-dim SVD of the debiased training residuals, **does beat the null**, with a paired interval excluding zero at both scales and on every selection.
+> But only just: 0.6867 against 0.6951 at 2566 users, recent-5, a paired difference of -0.0084 (95% CI -0.0100 to -0.0068, t = -10.2), about 1.2% of the null's error.
+> At 128 users it is 0.7287 against 0.7359, -0.0073 (CI -0.0112 to -0.0033, t = -3.6).
+> So latent factors do carry preference signal beyond the bias table, and the published arm hid it behind a units error; the signal an 8-dim factorisation captures is real but small.
+> See [The rating-unit associative arm](#the-rating-unit-associative-arm-issue-27).
+>
 > The comparisons further down are still correct as comparisons between those arms; what changed is what they mean.
 
 Five LLM prompt variants and an associative latent-factor baseline were asked the same question: given a user's rating history, predict the rating they gave to a held-out movie.
@@ -35,9 +42,10 @@ The recency effect described below has a point estimate of 0.047 MAE but a confi
 
 Both agents predict a rating in `[1, 5]` and are scored by MAE and RMSE against the rating the user actually gave.
 
-The associative prediction is a `bias + dot` reconstruction:
+The published associative prediction is `bias + dot`:
 `env.get_rating_bias(uid, mid) + dot(pref_vector, item_factor)`, clipped to `[1, 5]`.
-This is the decomposition the model was fitted on, rather than the affine `a * dot + b` formula.
+It was meant as a decomposition rather than the affine `a * dot + b` formula, but it is not one: the bias model and the SVD were fitted separately and on different targets, and the dot is a cosine, not a residual.
+See [Why the associative arm loses](#why-the-associative-arm-loses-its-dot-term-is-in-the-wrong-units) and the rating-unit fix that follows it.
 
 The LLM receives `k` examples of movies the user rated, each with title, genres, overview and the rating given, and predicts a rating for the held-out item.
 **No archetype or persona information appears in the prompt.**
@@ -232,7 +240,106 @@ It is a live example of the project's known trap that the associative and LLM ag
 - **The headline.** "The associative baseline beats every LLM arm by 0.122 MAE" is still true as a statement about those two arms. But both are worse than a bias table, so it does not say that latent factors beat content-based LLM prediction. It says a miscalibrated latent-factor arm beats a worse LLM arm.
 - **The LLM result.** The LLM arms are 0.18 to 0.25 MAE worse than the null. Given `k` rated examples, Qwen2.5-7B predicts ratings worse than the user's and item's average ratings do. That is the cleanest finding in this report.
 - **The floor for SASRec and every later backend is the null, not associative.** An arm has to beat 0.6951 at 2566 users, first-5, to show it represents preference at all.
-- **The associative arm needs fixing before it is used as a baseline again.** That is issue #27, kept separate because the same preference space drives the simulation's personas.
+- **The associative arm needed fixing before it was used as a baseline again.** Issue #27 did that without touching the persona space, below.
+
+---
+
+## The rating-unit associative arm (issue #27)
+
+Code: `sim/residual_factors.py` (the fit), `score_associative_residual` in `experiments/llm_vs_associative.py` (the arm), scored by `experiments/bias_only_null.py`.
+Per-item predictions are the `pred_associative_residual` and `residual_term` columns of `reports/bias_only_null/predictions_*.csv`, and the summary keys start `associative_residual` and `residual_`.
+
+### What changed, and what did not
+
+The fix is option 1 of the three in issue #27.
+A separate `TruncatedSVD` is fitted on the **debiased** training residuals, `rating - env.get_rating_bias(user, item)`, with **no normalisation** on either side.
+The prediction is `clip(bias + U[user] @ components_[:, item], 1, 5)`.
+`U` comes from `fit_transform`, so it already carries the singular values, and `components_` rows are unit-norm; the product is the rank-k reconstruction of the residual in stars, with the singular values counted once.
+A test recovers a known low-rank matrix exactly to pin that.
+
+Dimension is 8, the published arm's `user_pref_features`, so the new arm differs from the old one in target and scale only, not capacity.
+
+The fit uses `env.train_ratings` only.
+An evaluation user's factor row therefore comes from their own training ratings, exactly as their bias term does; held-out and validation ratings never enter the matrix.
+
+The persona preference space is **untouched**.
+`Environment` is not modified, its ChromaDB collections and cache keys are unchanged, and a test asserts that persona `pref_vector`s are identical before and after the residual fit.
+The residual SVD is not cached on disk: it takes seconds, and a cache would add a key to keep consistent for no benefit.
+Unit-norm cosine geometry remains what the simulation's personas drift in; whether it should be is a separate question this does not answer.
+
+### Results on the #26 pairs
+
+Same pairs as the null and the published arm, recent-5 (`--max-items 5 --item-selection first`), checked pair-for-pair by the script.
+Intervals are 95%, clustered by user.
+The reproduction guards passed again: the published arm came back at 0.704546 and 0.791589 at 128 users and 0.719526 at 2566 users.
+
+| Arm | Users | MAE | Minus null, paired | t | Beats the null? |
+|---|---|---|---|---|---|
+| bias-only null | 128 | 0.7359 | | | |
+| associative, published (cosine) | 128 | 0.7916 | +0.056 (0.017 to 0.095) | 2.8 | No, worse |
+| **associative, rating units** | 128 | **0.7287** | **-0.0073 (-0.0112 to -0.0033)** | **-3.6** | **Yes** |
+| bias-only null | 2566 | 0.6951 | | | |
+| associative, published (cosine) | 2566 | 0.7415 | +0.046 (0.037 to 0.055) | 10.0 | No, worse |
+| **associative, rating units** | 2566 | **0.6867** | **-0.0084 (-0.0100 to -0.0068)** | **-10.2** | **Yes** |
+
+Against the published arm on the same pairs, the fix gains 0.063 MAE at 128 users (t = -3.2) and 0.055 at 2566 users (t = -12.1).
+Every LLM arm is worse than it, as they were worse than the null.
+
+It holds on every selection:
+
+| Users | Selection | Null | Rating-unit associative | Difference, paired | t |
+|---|---|---|---|---|---|
+| 128 | first-5 (recent) | 0.7359 | 0.7287 | -0.0073 | -3.6 |
+| 128 | all held-out | 0.6579 | 0.6467 | -0.0095 | -7.3 |
+| 128 | random-5 | 0.7037 | 0.6956 | -0.0081 | -4.3 |
+| 2566 | first-5 (recent) | 0.6951 | 0.6867 | -0.0084 | -10.2 |
+| 2566 | all held-out | 0.6524 | 0.6419 | -0.0094 | -18.6 |
+| 2566 | random-5 | 0.6744 | 0.6647 | -0.0098 | -14.4 |
+
+So the issue's done-condition is met: the re-scored associative arm beats the bias-only null with a paired interval excluding zero.
+It is also a small effect.
+A gain of about 0.008 to 0.010 MAE is roughly 1% of the null's error, and it is the whole of what an 8-dim factorisation of the residual adds over a lookup table here.
+
+### Diagnostics: the offset is gone, the term is timid
+
+Measured on the recent-5 pairs, against the true residual `rating - bias`, on the same definitions as the published arm's table above:
+
+| | 128 users | 2566 users | Published arm, 128 / 2566 |
+|---|---|---|---|
+| Mean of the added term | +0.007 | +0.005 | +0.40 / +0.38 |
+| Std of the added term | 0.052 | 0.054 | 0.23 (128 users) |
+| Correlation with the true residual | 0.198 | 0.174 | 0.021 / 0.068 |
+| Least-squares scale | 3.57 | 3.00 | 0.008 / 0.125 |
+| Pairs with no factor row | 0 | 6 | |
+
+The systematic offset is gone, and the correlation with the residual is roughly three to ten times the published arm's.
+
+The least-squares scale is **not** near 1, though; it is about 3.
+That means the term points the right way but is too small, by about a factor of three on held-out pairs.
+This is not a units error of the published kind.
+It is the known shrinkage of a truncated SVD on a sparse matrix whose unobserved cells are implicit zeros: the matrix is 0.19% observed, so the rank-8 fit spends its capacity reconstructing mostly zeros and pulls every prediction toward 0.
+A one-off check on the 128-user environment's own training cells, in-sample, gives a scale of 1.69 and a correlation of 0.30, so the shrinkage is present before any generalisation gap and grows on held-out pairs.
+
+It was deliberately **not** corrected here.
+Rescaling the term by a factor fitted on held-out data would leak, and fitting it on validation is option 3 of the issue, the affine `a * dot + b` the report moved away from.
+A model that fits only observed cells, such as the platform `BiasedMF` or an ALS on residuals, is the principled way to remove it, and is the natural next associative backend for #13.
+
+### Secondary: dimension
+
+Secondary, because the primary result is fixed at the published arm's capacity.
+Paired differences against the null, same pairs:
+
+| Users | k | first-5 MAE | minus null (t) | all MAE | minus null (t) | LS scale, first-5 |
+|---|---|---|---|---|---|---|
+| 128 | 8 | 0.7287 | -0.0073 (-3.6) | 0.6467 | -0.0095 (-7.3) | 3.57 |
+| 128 | 32 | 0.7222 | -0.0137 (-4.5) | 0.6407 | -0.0149 (-7.9) | 2.84 |
+| 128 | 64 | 0.7172 | -0.0187 (-5.4) | 0.6397 | -0.0162 (-8.3) | 2.62 |
+| 2566 | 8 | 0.6867 | -0.0084 (-10.2) | 0.6419 | -0.0094 (-18.6) | 3.00 |
+| 2566 | 32 | 0.6828 | -0.0123 (-13.0) | 0.6376 | -0.0134 (-23.4) | 2.53 |
+| 2566 | 64 | 0.6824 | -0.0128 (-13.3) | 0.6365 | -0.0142 (-23.9) | 2.33 |
+
+More dimensions help a little and shrink a little less, with diminishing returns past 32 at 2566 users.
+Even at 64 dimensions the gain over the null is under 2% of its error, so the smallness of the effect is not mainly a capacity limit of the 8-dim arm.
 
 ---
 
@@ -271,7 +378,8 @@ It is worth noting that it points the same way, and on 20x the users, which is m
 
 ```bash
 # Bias-only null on both published sweeps, with the associative re-score,
-# selection robustness and dot-term diagnostics. About a minute.
+# the rating-unit associative arm (#27), selection robustness, term
+# diagnostics and the secondary dimension sweep. About three minutes.
 uv run python experiments/bias_only_null.py
 
 # Capped baseline, matched to the LLM arms. No LLM calls, about 15 s on a warm
