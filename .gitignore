@@ -25,3 +25,4 @@ logs/
 reports/.Rhistory
 reports/*.png
 reports/latest_*
+runs/

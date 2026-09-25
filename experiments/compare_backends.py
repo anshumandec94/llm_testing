@@ -261,6 +261,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def sweep_config(sweep: str) -> SimConfig:
+    """The harness config for a published sweep: `BASE_CONFIG` at its `eval_user_frac`."""
+    return dataclasses.replace(BASE_CONFIG, eval_user_frac=SWEEPS[sweep]["eval_user_frac"])
+
+
 def main(argv: list[str] | None = None) -> None:
     args = _parse_args(argv)
     reason = unavailable_reason(args.backend)
@@ -271,7 +276,7 @@ def main(argv: list[str] | None = None) -> None:
     if args.checkpoint is not None and not args.checkpoint.is_file():
         sys.exit(f"error: checkpoint {args.checkpoint} does not exist")
 
-    cfg = dataclasses.replace(BASE_CONFIG, eval_user_frac=SWEEPS[args.sweep]["eval_user_frac"])
+    cfg = sweep_config(args.sweep)
     max_items = args.max_items or None
     env = Environment(cfg)
     assignments = build_user_assignments(cfg, env, np.random.default_rng(cfg.random_seed))
