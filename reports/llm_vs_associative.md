@@ -3,7 +3,7 @@
 Experiment: `llm-agent-comparison` (`sqlite:///mlflow.db`)
 Script: `experiments/llm_vs_associative.py`
 LLM arms run 2026-06-26. Corrected baselines run 2026-08-25. Bias-only null and rating-unit associative arm run 2026-09-24.
-Last updated: 2026-09-24
+Last updated: 2026-09-25
 
 ---
 
@@ -17,9 +17,10 @@ Last updated: 2026-09-24
 > See [The bias-only null](#the-bias-only-null) below.
 >
 > **Fixed (issue #27).** An associative arm in rating units, `bias + U @ V` from an un-normalised 8-dim SVD of the debiased training residuals, **does beat the null**, with a paired interval excluding zero at both scales and on every selection.
-> But only just: 0.6867 against 0.6951 at 2566 users, recent-5, a paired difference of -0.0084 (95% CI -0.0100 to -0.0068, t = -10.2), about 1.2% of the null's error.
-> At 128 users it is 0.7287 against 0.7359, -0.0073 (CI -0.0112 to -0.0033, t = -3.6).
-> So latent factors do carry preference signal beyond the bias table, and the published arm hid it behind a units error; the signal an 8-dim factorisation captures is real but small.
+> Against the clamped null, the like-for-like comparison for a clipped arm, it gains 0.0070 MAE at 2566 users (95% CI 0.0060 to 0.0080, t = 13.8) and 0.0063 at 128 users (0.0026 to 0.0101, t = 3.3), about 1% of the null's error.
+> **That small gain is a property of the estimator, not of 8-dim factors.** The SVD treats the 99.8% of unobserved cells as zeros and is shrunk toward zero by them.
+> An untuned ALS of the same dimension, fitted on observed cells only, gains 0.042 at 2566 users (0.035 to 0.050, t = 11.1), about 6% of the null's error and six times the SVD's gain.
+> So latent factors carry real preference signal beyond the bias table, the published arm hid it behind a units error, and the zero-imputed SVD recovers only a fraction of it.
 > See [The rating-unit associative arm](#the-rating-unit-associative-arm-issue-27).
 >
 > The comparisons further down are still correct as comparisons between those arms; what changed is what they mean.
@@ -240,7 +241,7 @@ It is a live example of the project's known trap that the associative and LLM ag
 - **The headline.** "The associative baseline beats every LLM arm by 0.122 MAE" is still true as a statement about those two arms. But both are worse than a bias table, so it does not say that latent factors beat content-based LLM prediction. It says a miscalibrated latent-factor arm beats a worse LLM arm.
 - **The LLM result.** The LLM arms are 0.18 to 0.25 MAE worse than the null. Given `k` rated examples, Qwen2.5-7B predicts ratings worse than the user's and item's average ratings do. That is the cleanest finding in this report.
 - **The floor for SASRec and every later backend is the null, not associative.** An arm has to beat 0.6951 at 2566 users, first-5, to show it represents preference at all.
-- **The associative arm needed fixing before it was used as a baseline again.** Issue #27 did that without touching the persona space, below.
+- **The associative arm needed fixing before it was used as a baseline again.** Issue #27 did that without touching the persona space, below. An observed-cells fit of the same residuals does much better than the zero-imputed SVD, so which associative estimator becomes the benchmark backend is issue #13's decision.
 
 ---
 
@@ -273,73 +274,93 @@ Same pairs as the null and the published arm, recent-5 (`--max-items 5 --item-se
 Intervals are 95%, clustered by user.
 The reproduction guards passed again: the published arm came back at 0.704546 and 0.791589 at 128 users and 0.719526 at 2566 users.
 
-| Arm | Users | MAE | Minus null, paired | t | Beats the null? |
+**The primary comparison for a clipped arm is the clamped null.**
+The rating-unit arms are clipped to `[1, 5]`, and clipping alone lowers the null's MAE by 0.0009 at 128 users and 0.0014 at 2566.
+Comparing a clipped arm against the unclamped null credits it with that, which is 12 to 16% of the SVD arm's apparent gain.
+The unclamped differences are kept in `summary.json` alongside.
+
+| Arm | Users | MAE | Minus clamped null, paired | t | Beats the null? |
 |---|---|---|---|---|---|
-| bias-only null | 128 | 0.7359 | | | |
-| associative, published (cosine) | 128 | 0.7916 | +0.056 (0.017 to 0.095) | 2.8 | No, worse |
-| **associative, rating units** | 128 | **0.7287** | **-0.0073 (-0.0112 to -0.0033)** | **-3.6** | **Yes** |
-| bias-only null | 2566 | 0.6951 | | | |
-| associative, published (cosine) | 2566 | 0.7415 | +0.046 (0.037 to 0.055) | 10.0 | No, worse |
-| **associative, rating units** | 2566 | **0.6867** | **-0.0084 (-0.0100 to -0.0068)** | **-10.2** | **Yes** |
+| bias-only null, clamped | 128 | 0.7350 | | | |
+| associative, published (cosine) | 128 | 0.7916 | +0.057 (0.018 to 0.096) | 2.8 | No, worse |
+| **associative, rating units (SVD)** | 128 | **0.7287** | **-0.0063 (-0.0101 to -0.0026)** | **-3.3** | **Yes** |
+| associative, ALS, secondary | 128 | 0.6954 | -0.040 (-0.071 to -0.009) | -2.5 | Yes |
+| bias-only null, clamped | 2566 | 0.6938 | | | |
+| associative, published (cosine) | 2566 | 0.7415 | +0.048 (0.039 to 0.057) | 10.4 | No, worse |
+| **associative, rating units (SVD)** | 2566 | **0.6867** | **-0.0070 (-0.0080 to -0.0060)** | **-13.8** | **Yes** |
+| associative, ALS, secondary | 2566 | 0.6515 | -0.042 (-0.050 to -0.035) | -11.1 | Yes |
 
-Against the published arm on the same pairs, the fix gains 0.063 MAE at 128 users (t = -3.2) and 0.055 at 2566 users (t = -12.1).
-Every LLM arm is worse than it, as they were worse than the null.
+Against the published arm on the same pairs, the SVD fix gains 0.063 MAE at 128 users (t = -3.2) and 0.055 at 2566 users (t = -12.1).
+Every LLM arm is worse than all of them.
 
-It holds on every selection:
+It holds on every selection, against the clamped null:
 
-| Users | Selection | Null | Rating-unit associative | Difference, paired | t |
-|---|---|---|---|---|---|
-| 128 | first-5 (recent) | 0.7359 | 0.7287 | -0.0073 | -3.6 |
-| 128 | all held-out | 0.6579 | 0.6467 | -0.0095 | -7.3 |
-| 128 | random-5 | 0.7037 | 0.6956 | -0.0081 | -4.3 |
-| 2566 | first-5 (recent) | 0.6951 | 0.6867 | -0.0084 | -10.2 |
-| 2566 | all held-out | 0.6524 | 0.6419 | -0.0094 | -18.6 |
-| 2566 | random-5 | 0.6744 | 0.6647 | -0.0098 | -14.4 |
+| Users | Selection | Clamped null | SVD | SVD minus null (t) | ALS | ALS minus null (t) |
+|---|---|---|---|---|---|---|
+| 128 | first-5 (recent) | 0.7350 | 0.7287 | -0.0063 (-3.3) | 0.6954 | -0.040 (-2.5) |
+| 128 | all held-out | 0.6564 | 0.6467 | -0.0085 (-7.5) | 0.6208 | -0.029 (-2.5) |
+| 128 | random-5 | 0.7020 | 0.6957 | -0.0063 (-3.9) | 0.6833 | -0.019 (-1.0) |
+| 2566 | first-5 (recent) | 0.6938 | 0.6867 | -0.0070 (-13.8) | 0.6515 | -0.042 (-11.1) |
+| 2566 | all held-out | 0.6518 | 0.6419 | -0.0084 (-28.6) | 0.6082 | -0.045 (-19.6) |
+| 2566 | random-5 | 0.6735 | 0.6647 | -0.0088 (-16.1) | 0.6267 | -0.047 (-12.7) |
 
-So the issue's done-condition is met: the re-scored associative arm beats the bias-only null with a paired interval excluding zero.
-It is also a small effect.
-A gain of about 0.008 to 0.010 MAE is roughly 1% of the null's error, and it is the whole of what an 8-dim factorisation of the residual adds over a lookup table here.
+So the issue's done-condition is met: the SVD arm beats the bias-only null with a paired interval excluding zero, at both scales and on every selection.
+The ALS is noisier at 128 users, and on random-5 there its interval spans zero; at 2566 users every ALS interval excludes zero by a wide margin.
 
-### Diagnostics: the offset is gone, the term is timid
+### The small SVD gain is estimator shrinkage, not a limit of the representation
 
-Measured on the recent-5 pairs, against the true residual `rating - bias`, on the same definitions as the published arm's table above:
+The SVD's gain is about 1% of the null's error.
+That is **not** what 8-dim latent factors of the residual can add here.
+It is what a zero-imputed SVD of them adds.
 
-| | 128 users | 2566 users | Published arm, 128 / 2566 |
+The residual matrix is about 0.2% observed.
+`TruncatedSVD` treats every unobserved cell as a residual of exactly zero, so a rank-8 fit spends its capacity reconstructing zeros and pulls every prediction toward zero.
+ALS, which fits observed cells only, removes that and nothing else: same residuals, same dimension, same train split, same pairs.
+It is a secondary diagnostic, fitted once with one untuned configuration (`lambda = 5`, 10 iterations, seed 42) chosen before any held-out number was seen, and it is not proposed here as the replacement baseline; that choice belongs to issue #13.
+
+Measured on the recent-5 pairs, against the true residual `rating - bias`:
+
+| | SVD, 128 / 2566 | ALS, 128 / 2566 | Published arm, 128 / 2566 |
 |---|---|---|---|
-| Mean of the added term | +0.007 | +0.005 | +0.40 / +0.38 |
-| Std of the added term | 0.052 | 0.054 | 0.23 (128 users) |
-| Correlation with the true residual | 0.198 | 0.174 | 0.021 / 0.068 |
-| Least-squares scale | 3.57 | 3.00 | 0.008 / 0.125 |
-| Pairs with no factor row | 0 | 6 | |
+| Mean of the added term | +0.007 / +0.005 | +0.005 / +0.052 | +0.40 / +0.38 |
+| Std of the added term | 0.052 / 0.054 | 0.45 / 0.42 | 0.23 (128 users) |
+| Correlation with the true residual | 0.197 / 0.174 | 0.337 / 0.328 | 0.021 / 0.068 |
+| Least-squares scale, first-5 | 3.56 / 3.01 | 0.71 / 0.71 | 0.008 / 0.125 |
+| Least-squares scale, all held-out | 2.81 / 2.53 | 0.64 / 0.75 | |
+| In-sample scale (500k training cells) | 1.68 / 1.67 | 1.05 / 1.04 | |
+| In-sample correlation | 0.30 / 0.30 | 0.50 / 0.49 | |
+| Pairs with no factor row | 0 / 6 | 0 / 6 | |
 
-The systematic offset is gone, and the correlation with the residual is roughly three to ten times the published arm's.
+Three things follow.
 
-The least-squares scale is **not** near 1, though; it is about 3.
-That means the term points the right way but is too small, by about a factor of three on held-out pairs.
-This is not a units error of the published kind.
-It is the known shrinkage of a truncated SVD on a sparse matrix whose unobserved cells are implicit zeros: the matrix is 0.19% observed, so the rank-8 fit spends its capacity reconstructing mostly zeros and pulls every prediction toward 0.
-A one-off check on the 128-user environment's own training cells, in-sample, gives a scale of 1.69 and a correlation of 0.30, so the shrinkage is present before any generalisation gap and grows on held-out pairs.
+- **The SVD term is too small by a factor of about 3 on held-out pairs, and about 1.7 even on its own training cells.** A term in the right units has a least-squares scale near 1. Being too small in-sample is the signature of shrinkage, since no generalisation gap exists there.
+- **The ALS term is on the right scale in-sample (1.05) and slightly too large on held-out pairs (0.64 to 0.75).** That is ordinary overfitting at an untuned regularisation, the opposite direction to the SVD's problem.
+- **The gap between in-sample and held-out scale is partly generalisation and recency, not only shrinkage.** For the SVD it grows from 1.7 in-sample to 2.5 to 2.8 on all held-out items and 3.0 to 3.6 on the recent-5 slice.
 
-It was deliberately **not** corrected here.
-Rescaling the term by a factor fitted on held-out data would leak, and fitting it on validation is option 3 of the issue, the affine `a * dot + b` the report moved away from.
-A model that fits only observed cells, such as the platform `BiasedMF` or an ALS on residuals, is the principled way to remove it, and is the natural next associative backend for #13.
+The SVD was deliberately **not** rescaled.
+Fitting a scale on held-out data would leak, and fitting it on validation is option 3 of the issue, the affine `a * dot + b` the report moved away from.
+The TruncatedSVD uses the exact ARPACK solver, so the arm does not depend on a random seed.
 
 ### Secondary: dimension
 
 Secondary, because the primary result is fixed at the published arm's capacity.
-Paired differences against the null, same pairs:
+Paired differences against the clamped null, same pairs:
 
-| Users | k | first-5 MAE | minus null (t) | all MAE | minus null (t) | LS scale, first-5 |
-|---|---|---|---|---|---|---|
-| 128 | 8 | 0.7287 | -0.0073 (-3.6) | 0.6467 | -0.0095 (-7.3) | 3.57 |
-| 128 | 32 | 0.7222 | -0.0137 (-4.5) | 0.6407 | -0.0149 (-7.9) | 2.84 |
-| 128 | 64 | 0.7172 | -0.0187 (-5.4) | 0.6397 | -0.0162 (-8.3) | 2.62 |
-| 2566 | 8 | 0.6867 | -0.0084 (-10.2) | 0.6419 | -0.0094 (-18.6) | 3.00 |
-| 2566 | 32 | 0.6828 | -0.0123 (-13.0) | 0.6376 | -0.0134 (-23.4) | 2.53 |
-| 2566 | 64 | 0.6824 | -0.0128 (-13.3) | 0.6365 | -0.0142 (-23.9) | 2.33 |
+| Users | Arm | k | first-5 MAE | minus null (t) | all MAE | minus null (t) | LS scale, first-5 |
+|---|---|---|---|---|---|---|---|
+| 128 | SVD | 8 | 0.7287 | -0.0063 (-3.3) | 0.6467 | -0.0085 (-7.5) | 3.56 |
+| 128 | SVD | 32 | 0.7224 | -0.0126 (-4.7) | 0.6403 | -0.0143 (-8.6) | 3.15 |
+| 128 | SVD | 64 | 0.7198 | -0.0153 (-4.7) | 0.6395 | -0.0149 (-8.1) | 2.65 |
+| 128 | ALS | 8 | 0.6954 | -0.040 (-2.5) | 0.6208 | -0.029 (-2.5) | 0.71 |
+| 2566 | SVD | 8 | 0.6867 | -0.0070 (-13.8) | 0.6419 | -0.0084 (-28.6) | 3.01 |
+| 2566 | SVD | 32 | 0.6826 | -0.0111 (-16.0) | 0.6376 | -0.0126 (-31.2) | 2.52 |
+| 2566 | SVD | 64 | 0.6828 | -0.0110 (-15.4) | 0.6363 | -0.0132 (-30.5) | 2.28 |
+| 2566 | ALS | 8 | 0.6515 | -0.042 (-11.1) | 0.6082 | -0.045 (-19.6) | 0.71 |
 
-More dimensions help a little and shrink a little less, with diminishing returns past 32 at 2566 users.
-Even at 64 dimensions the gain over the null is under 2% of its error, so the smallness of the effect is not mainly a capacity limit of the 8-dim arm.
+More SVD dimensions help a little and shrink a little less, with nothing gained past 32 at 2566 users.
+An 8-dim ALS beats a 64-dim SVD by about 0.03 MAE at 2566 users.
+Adding capacity to the zero-imputed estimator does not recover what changing the estimator does.
+ALS is swept at k = 8 only, because the vectorised solver's memory grows with k squared and a k = 32 fit did not fit in memory on the development machine.
 
 ---
 
@@ -379,8 +400,11 @@ It is worth noting that it points the same way, and on 20x the users, which is m
 ```bash
 # Bias-only null on both published sweeps, with the associative re-score,
 # the rating-unit associative arm (#27), selection robustness, term
-# diagnostics and the secondary dimension sweep. About three minutes.
-uv run python experiments/bias_only_null.py
+# diagnostics, the secondary ALS and the secondary dimension sweep.
+# About 2.5 minutes and 10 GB of memory per sweep, so on a laptop run them
+# one at a time; summary.json merges.
+uv run python experiments/bias_only_null.py --sweep u128
+uv run python experiments/bias_only_null.py --sweep u2566
 
 # Capped baseline, matched to the LLM arms. No LLM calls, about 15 s on a warm
 # embedding cache.

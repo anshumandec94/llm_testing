@@ -16,7 +16,9 @@ from experiments.bias_only_null import score_bias_only
 from experiments.llm_vs_associative import score_associative_residual
 from sim.population import build_user_assignments
 from sim.residual_factors import (
+    fit_env_residual_als,
     fit_env_residual_factors,
+    fit_residual_als,
     fit_residual_factors,
     training_residuals,
 )
@@ -71,6 +73,92 @@ class TestReconstructionScale:
         assert factors.n_components == tiny_config.user_pref_features
 
 
+    def test_vectorised_lookup_matches_the_scalar_one(self, factors, env):
+        users = np.array(list(env.train_ratings["userId"][:50]) + [-1])
+        items = np.array(list(env.train_ratings["movieId"][:50]) + [int(factors.item_ids[0])])
+        expected = [factors.residual(u, m) for u, m in zip(users, items)]
+        np.testing.assert_allclose(factors.residuals(users, items), expected)
+        assert not factors.covered(users, items)[-1]
+
+
+class TestComponentGuards:
+
+    @pytest.fixture
+    def small(self):
+        rng = np.random.default_rng(1)
+        uu, ii = np.meshgrid(np.arange(6), np.arange(5), indexing="ij")
+        return pd.DataFrame({
+            "userId": uu.ravel(), "movieId": ii.ravel(), "residual": rng.normal(size=30),
+        })
+
+    @pytest.mark.parametrize("fit", [fit_residual_factors, fit_residual_als])
+    def test_zero_components_is_a_clear_error(self, small, fit):
+        with pytest.raises(ValueError, match="at least 1"):
+            fit(small, n_components=0, random_state=0)
+
+    def test_svd_refuses_to_fit_fewer_dimensions_than_asked(self, small):
+        """ARPACK caps k at min(shape) - 1; asking for more must not silently shrink."""
+        with pytest.raises(ValueError, match="too large"):
+            fit_residual_factors(small, n_components=5, random_state=0)
+        assert fit_residual_factors(small, n_components=4, random_state=0).n_components == 4
+
+    def test_svd_is_exact_and_seed_independent(self, small):
+        a = fit_residual_factors(small, n_components=3, random_state=0)
+        b = fit_residual_factors(small, n_components=3, random_state=123)
+        recon_a = a.user_factors @ a.item_factors.T
+        np.testing.assert_allclose(recon_a, b.user_factors @ b.item_factors.T, atol=1e-10)
+        dense = small.pivot(index="userId", columns="movieId", values="residual").to_numpy()
+        assert a.singular_values is not None
+        np.testing.assert_allclose(np.sort(a.singular_values)[::-1], np.linalg.svd(dense)[1][:3])
+
+
+class TestResidualAls:
+
+    def test_matches_a_row_by_row_reference(self):
+        """The vectorised half-steps must solve the same normal equations as a loop."""
+        rng = np.random.default_rng(3)
+        n_users, n_items, k, lam = 15, 12, 3, 0.7
+        mask = rng.random((n_users, n_items)) < 0.4
+        mask[:, 0] = True  # every user observed at least once
+        users, items = np.nonzero(mask)
+        values = rng.normal(size=len(users))
+        frame = pd.DataFrame({"userId": users, "movieId": items, "residual": values})
+        fitted = fit_residual_als(frame, k, random_state=5, regularization=lam, iterations=4)
+
+        init = np.random.default_rng(5)
+        p = init.normal(scale=0.1, size=(n_users, k))
+        q = init.normal(scale=0.1, size=(n_items, k))
+        dense = np.zeros((n_users, n_items))
+        dense[users, items] = values
+        for _ in range(4):
+            for u in range(n_users):
+                cols = np.nonzero(mask[u])[0]
+                x = q[cols]
+                p[u] = np.linalg.solve(x.T @ x + lam * np.eye(k), x.T @ dense[u, cols])
+            for i in range(n_items):
+                rows = np.nonzero(mask[:, i])[0]
+                x = p[rows]
+                q[i] = np.linalg.solve(x.T @ x + lam * np.eye(k), x.T @ dense[rows, i])
+        np.testing.assert_allclose(fitted.user_factors, p, atol=1e-10)
+        np.testing.assert_allclose(fitted.item_factors, q, atol=1e-10)
+
+    def test_recovers_a_fully_observed_low_rank_matrix(self):
+        rng = np.random.default_rng(0)
+        truth = rng.normal(size=(10, 2)) @ rng.normal(size=(2, 8))
+        uu, ii = np.meshgrid(np.arange(10), np.arange(8), indexing="ij")
+        frame = pd.DataFrame({"userId": uu.ravel(), "movieId": ii.ravel(), "residual": truth.ravel()})
+        fitted = fit_residual_als(frame, 2, random_state=0, regularization=1e-9, iterations=200)
+        np.testing.assert_allclose(fitted.user_factors @ fitted.item_factors.T, truth, atol=1e-5)
+
+    def test_env_als_is_fitted_on_training_cells_only(self, env, tiny_config):
+        fitted = fit_env_residual_als(env)
+        train = env.train_ratings
+        np.testing.assert_array_equal(fitted.user_ids, np.sort(train["userId"].unique()))
+        np.testing.assert_array_equal(fitted.item_ids, np.sort(train["movieId"].unique()))
+        assert fitted.n_components == tiny_config.user_pref_features
+        assert fitted.singular_values is None
+
+
 class TestFittedOnTrainingOnly:
 
     def test_residuals_cover_exactly_the_training_ratings(self, env):
@@ -120,6 +208,7 @@ class TestPersonaSpaceUntouched:
         before_factors = {u: v.copy() for u, v in env._user_pref_factors.items()}
         before_collection = env.user_pref_collection_name
         fit_env_residual_factors(env, n_components=3)
+        fit_env_residual_als(env, n_components=3)
         after_vectors = pref_vectors()
 
         assert env.user_pref_collection_name == before_collection
