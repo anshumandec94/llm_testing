@@ -25,6 +25,10 @@ from sim.agents.llm import LLMAgent
 from sim.population import build_user_assignments
 from sim.user_agent import SimulatedUser
 
+# mlx-lm is only installed on macOS (see the sys_platform marker in
+# pyproject.toml). Skip the whole module where it cannot be imported.
+pytest.importorskip("mlx_lm")
+
 
 # ── mlx_lm API contract ───────────────────────────────────────────────────────
 # These tests verify assumptions our code makes about mlx_lm's API.
