@@ -18,6 +18,7 @@ from sim.agents.sasrec_data import (
     DEFAULT_MAXLEN,
     PAD_INDEX,
     PAD_SENTINEL_ID,
+    SasrecWindowIndex,
     build_item_vocabulary,
     build_sasrec_sequences,
     resolve_window_stride,
@@ -408,8 +409,17 @@ def long_data(long_user_env):
     return build_sasrec_sequences(long_user_env, maxlen=WINDOW_MAXLEN)
 
 
-def _user_window_ends(index: np.ndarray, uid: int) -> list[int]:
-    return [int(end) for u, end in index.tolist() if u == uid]
+def _user_window_ends(index: SasrecWindowIndex, uid: int) -> list[int]:
+    return [int(end) for u, end in index.rows.tolist() if u == uid]
+
+
+def _window(uid: int, end: int) -> SasrecWindowIndex:
+    """One hand-picked window at the fixture's maxlen, for boundary tests."""
+    return SasrecWindowIndex(
+        rows=np.array([[uid, end]], dtype=np.int64),
+        maxlen=WINDOW_MAXLEN,
+        stride=WINDOW_MAXLEN,
+    )
 
 
 class TestWindowEnumeration:
@@ -431,7 +441,7 @@ class TestWindowEnumeration:
         training set is a strict subset of the new one: targets are the last
         maxlen interactions, inputs the maxlen interactions before each.
         """
-        batch = long_data.training_batch(np.array([[1, LONG_LEN]]))
+        batch = long_data.training_batch(_window(1, LONG_LEN))
         seq = long_data.user_sequences[1]
         res = long_data.user_residuals[1]
         assert np.array_equal(batch.target_items[0], seq[-WINDOW_MAXLEN:])
@@ -440,7 +450,7 @@ class TestWindowEnumeration:
         assert np.array_equal(batch.input_residuals[0], res[-WINDOW_MAXLEN - 1 : -1])
 
     def test_oldest_remainder_is_left_padded(self, long_data):
-        batch = long_data.training_batch(np.array([[1, 7]]))
+        batch = long_data.training_batch(_window(1, 7))
         seq = long_data.user_sequences[1]
         # Targets are positions 1..6, inputs 0..5: six real slots, two pads.
         assert np.all(batch.target_items[0, :2] == PAD_INDEX)
@@ -452,7 +462,7 @@ class TestWindowEnumeration:
     def test_default_stride_makes_every_later_interaction_a_target_once(self, long_data):
         index = long_data.training_window_index()
         for uid, seq in long_data.user_sequences.items():
-            rows = index[index[:, 0] == uid]
+            rows = index.rows[index.user_ids == uid]
             covered: list[int] = []
             for _, end in rows.tolist():
                 covered.extend(range(max(1, end - WINDOW_MAXLEN), end))
@@ -490,7 +500,25 @@ class TestWindowEnumeration:
 
     def test_user_ids_filter_the_index(self, long_data):
         index = long_data.training_window_index(user_ids=[2, 1])
-        assert index[:, 0].tolist() == [2, 1, 1, 1]
+        assert index.user_ids.tolist() == [2, 1, 1, 1]
+
+    def test_duplicate_user_ids_duplicate_windows(self, long_data):
+        """Documented, and consistent with padded_matrix: no silent dedup."""
+        index = long_data.training_window_index(user_ids=[2, 2])
+        assert index.user_ids.tolist() == [2, 2]
+
+    def test_index_remembers_its_maxlen_and_stride(self, long_data):
+        index = long_data.training_window_index(maxlen=4, stride=2)
+        assert (index.maxlen, index.stride) == (4, 2)
+        default = long_data.training_window_index()
+        assert (default.maxlen, default.stride) == (WINDOW_MAXLEN, WINDOW_MAXLEN)
+
+    def test_slicing_the_index_keeps_maxlen_and_stride(self, long_data):
+        index = long_data.training_window_index(maxlen=4, stride=2)
+        shuffled = index[np.random.default_rng(0).permutation(len(index))[:3]]
+        assert len(shuffled) == 3
+        assert (shuffled.maxlen, shuffled.stride) == (4, 2)
+        assert len(index[0]) == 1
 
     def test_num_users_still_counts_users_not_windows(self, long_data):
         assert long_data.num_users == 4
@@ -554,13 +582,33 @@ class TestWindowContents:
         for arr in (batch.input_residuals, batch.target_residuals):
             assert arr.shape == (len(index), WINDOW_MAXLEN)
             assert arr.dtype == np.float32
-        assert batch.user_ids.tolist() == index[:, 0].tolist()
+        assert batch.user_ids.tolist() == index.user_ids.tolist()
 
     def test_out_of_range_window_is_rejected(self, long_data):
         with pytest.raises(ValueError, match="out of range"):
-            long_data.training_batch(np.array([[1, LONG_LEN + 1]]))
+            long_data.training_batch(_window(1, LONG_LEN + 1))
         with pytest.raises(ValueError, match="out of range"):
-            long_data.training_batch(np.array([[1, 1]]))
+            long_data.training_batch(_window(1, 1))
+
+    def test_batch_width_always_matches_the_index(self, long_data):
+        """
+        An index built at maxlen=4 materialises at width 4 even though the
+        dataset's own maxlen is 8, and one built at 8 cannot be narrowed: the
+        batch never drops part of a window.
+        """
+        narrow = long_data.training_window_index(maxlen=4)
+        batch = long_data.training_batch(narrow)
+        assert batch.target_items.shape == (len(narrow), 4)
+        n_targets = int(np.count_nonzero(batch.target_items != PAD_INDEX))
+        assert n_targets == sum(max(len(s) - 1, 0) for s in long_data.user_sequences.values())
+
+        wide = long_data.training_window_index()
+        assert long_data.training_batch(wide).target_items.shape[1] == WINDOW_MAXLEN
+
+    def test_a_raw_array_is_rejected(self, long_data):
+        rows = long_data.training_window_index().rows
+        with pytest.raises(TypeError, match="SasrecWindowIndex"):
+            long_data.training_batch(rows)
 
     def test_held_out_rating_never_enters_a_window(self, long_data):
         batch = long_data.training_batch(long_data.training_window_index(stride=1))
@@ -632,7 +680,7 @@ class TestInferenceIgnoresWindows:
         The newest training window predicts the last training item; inference
         feeds that item in and predicts what comes after it.
         """
-        newest = long_data.training_batch(np.array([[1, LONG_LEN]]))
+        newest = long_data.training_batch(_window(1, LONG_LEN))
         items, _ = long_data.padded_sequence(1)
         assert np.array_equal(items[:-1], newest.input_items[0, 1:])
         assert items[-1] == newest.target_items[0, -1]
@@ -646,6 +694,42 @@ class TestWindowStrideConfig:
     def test_out_of_range_strides_are_rejected(self, stride):
         with pytest.raises(ValueError, match="window stride"):
             resolve_window_stride(stride, 200)
+
+    @pytest.mark.parametrize("stride", [2.5, 8.0, True, False, "8"])
+    def test_non_integer_strides_are_rejected(self, stride):
+        """2.5 would truncate and True would pass as 1."""
+        with pytest.raises(TypeError, match="window stride must be an int"):
+            resolve_window_stride(stride, 8)
+
+    def test_numpy_integers_are_accepted(self):
+        assert resolve_window_stride(np.int64(4), np.int32(8)) == 4
+
+    @pytest.mark.parametrize("maxlen", [8.0, True])
+    def test_non_integer_maxlen_is_rejected(self, maxlen):
+        with pytest.raises(TypeError, match="maxlen must be an int"):
+            resolve_window_stride(None, maxlen)
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"sasrec_window_stride": 0},
+            {"sasrec_window_stride": -3},
+            {"sasrec_maxlen": 50, "sasrec_window_stride": 500},
+        ],
+    )
+    def test_simconfig_rejects_out_of_range_strides(self, kwargs):
+        with pytest.raises(ValueError, match="window stride"):
+            SimConfig(**kwargs)
+
+    def test_simconfig_rejects_non_integer_strides(self):
+        with pytest.raises(TypeError, match="window stride must be an int"):
+            SimConfig(sasrec_window_stride=2.5)  # ty: ignore[invalid-argument-type]
+
+    def test_simconfig_rejects_a_bad_stride_from_json(self):
+        payload = SimConfig().to_json_dict()
+        payload["sasrec_window_stride"] = 0
+        with pytest.raises(ValueError, match="window stride"):
+            SimConfig.from_dict(payload)
 
     def test_bad_stride_fails_at_build_time(self, long_user_env):
         with pytest.raises(ValueError, match="window stride"):

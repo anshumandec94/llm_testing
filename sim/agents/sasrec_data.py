@@ -62,7 +62,9 @@ PAD_SENTINEL_ID = -1
 DEFAULT_MAXLEN = 200
 
 
-def resolve_window_stride(stride: int | None, maxlen: int) -> int:
+def resolve_window_stride(
+    stride: int | np.integer | None, maxlen: int | np.integer
+) -> int:
     """
     Effective training-window stride.
 
@@ -72,11 +74,21 @@ def resolve_window_stride(stride: int | None, maxlen: int) -> int:
     accident fails loudly. A stride above ``maxlen`` is rejected too: it would
     leave gaps between windows and silently discard interactions, which is the
     exact problem windowing exists to fix.
+
+    Both arguments must be real integers. ``2.5`` would otherwise truncate and
+    ``True`` would pass as ``1``, and either is far more likely a config typo
+    than an intended stride.
     """
+    for name, value in (("maxlen", maxlen), ("window stride", stride)):
+        if value is not None and (
+            isinstance(value, (bool, np.bool_))
+            or not isinstance(value, (int, np.integer))
+        ):
+            raise TypeError(f"{name} must be an int, got {value!r}")
     if maxlen < 1:
         raise ValueError(f"training windows need maxlen >= 1, got {maxlen}")
     if stride is None:
-        return maxlen
+        return int(maxlen)
     if not 1 <= stride <= maxlen:
         raise ValueError(
             f"window stride must be in [1, maxlen={maxlen}], got {stride}; "
@@ -111,6 +123,45 @@ class SasrecTrainingBatch:
 
     user_ids: np.ndarray
     """``(n_windows,)`` owning userId per row. Diagnostic only; the model takes no user input."""
+
+
+@dataclass(frozen=True)
+class SasrecWindowIndex:
+    """
+    Training windows, enumerated but not materialised.
+
+    Carries the ``maxlen`` and stride the rows were built with, so
+    ``training_batch`` cannot materialise them at a different width. A batch
+    narrower than its index would silently drop the oldest part of every
+    window, which no shape check downstream would catch.
+
+    Index with ``[]`` (a slice, an integer array from a shuffle, a mask) to
+    take a mini-batch; the result keeps the same ``maxlen`` and stride.
+    """
+
+    rows: np.ndarray
+    """``(n_windows, 2)`` int64 ``(userId, target_end)`` rows."""
+
+    maxlen: int
+    stride: int
+
+    def __len__(self) -> int:
+        return len(self.rows)
+
+    def __getitem__(self, key) -> "SasrecWindowIndex":
+        return SasrecWindowIndex(
+            rows=self.rows[key].reshape(-1, 2),
+            maxlen=self.maxlen,
+            stride=self.stride,
+        )
+
+    @property
+    def user_ids(self) -> np.ndarray:
+        return self.rows[:, 0]
+
+    @property
+    def target_ends(self) -> np.ndarray:
+        return self.rows[:, 1]
 
 
 @dataclass
@@ -237,16 +288,22 @@ class SasrecSequenceData:
         maxlen: int | None = None,
         stride: int | None = None,
         user_ids: list[int] | None = None,
-    ) -> np.ndarray:
+    ) -> SasrecWindowIndex:
         """
         Enumerate the training windows without materialising them.
 
-        Returns an ``(n_windows, 2)`` int64 array of ``(userId, target_end)``
-        rows. A window's targets are the user's positions
-        ``[max(1, target_end - maxlen), target_end)`` and its inputs are the
-        same range shifted back by one, so every window is a contiguous,
-        timestamp-ascending "predict the next item" problem. Pass rows (all of
-        them, or a shuffled mini-batch) to ``training_batch``.
+        Returns a ``SasrecWindowIndex`` of ``(userId, target_end)`` rows that
+        remembers this ``maxlen`` and stride. A window's targets are the user's
+        positions ``[max(1, target_end - maxlen), target_end)`` and its inputs
+        are the same range shifted back by one, so every window is a
+        contiguous, timestamp-ascending "predict the next item" problem. Pass
+        the index (all of it, or a shuffled mini-batch of it) to
+        ``training_batch``.
+
+        Rows follow ``user_ids`` order, sorted userIds by default. As with
+        ``padded_matrix``, a userId listed twice is enumerated twice, so its
+        windows appear twice; deduplicate first if that is not wanted. Unknown
+        userIds are skipped.
 
         **Anchoring.** Windows are anchored at the most recent end:
         ``target_end`` runs ``L, L - stride, L - 2 * stride, ...`` for a
@@ -284,27 +341,34 @@ class SasrecSequenceData:
                 if end - length <= 1:
                     break
                 end -= step
-        return np.array(rows, dtype=np.int64).reshape(-1, 2)
+        return SasrecWindowIndex(
+            rows=np.array(rows, dtype=np.int64).reshape(-1, 2),
+            maxlen=int(length),
+            stride=step,
+        )
 
-    def training_batch(
-        self, windows: np.ndarray, maxlen: int | None = None
-    ) -> SasrecTrainingBatch:
+    def training_batch(self, windows: SasrecWindowIndex) -> SasrecTrainingBatch:
         """
-        Materialise rows of ``training_window_index`` into padded arrays.
+        Materialise a ``SasrecWindowIndex`` into padded arrays.
 
         Kept separate from the index so a training loop can shuffle and batch
-        windows without holding every window of ML-32M in memory at once.
-        ``maxlen`` must match the one the index was built with.
+        windows without holding every window of ML-32M in memory at once. The
+        width is the index's own ``maxlen`` and cannot be overridden here, so a
+        batch always holds whole windows.
         """
-        length = self.maxlen if maxlen is None else maxlen
-        windows = np.asarray(windows, dtype=np.int64).reshape(-1, 2)
+        if not isinstance(windows, SasrecWindowIndex):
+            raise TypeError(
+                "training_batch takes a SasrecWindowIndex from "
+                f"training_window_index, got {type(windows).__name__}"
+            )
+        length = windows.maxlen
         n = len(windows)
         input_items = np.zeros((n, length), dtype=np.int32)
         input_residuals = np.zeros((n, length), dtype=np.float32)
         target_items = np.zeros((n, length), dtype=np.int32)
         target_residuals = np.zeros((n, length), dtype=np.float32)
 
-        for row, (uid, end) in enumerate(windows.tolist()):
+        for row, (uid, end) in enumerate(windows.rows.tolist()):
             seq = self.user_sequences[uid]
             res = self.user_residuals[uid]
             if not 2 <= end <= len(seq):
@@ -324,7 +388,7 @@ class SasrecSequenceData:
             input_residuals=input_residuals,
             target_items=target_items,
             target_residuals=target_residuals,
-            user_ids=windows[:, 0].copy(),
+            user_ids=windows.user_ids.copy(),
         )
 
 

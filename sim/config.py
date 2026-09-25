@@ -129,7 +129,8 @@ class SimConfig:
     # Stride between contiguous training windows over one user's history
     # (issue #24). None means "equal to sasrec_maxlen": disjoint windows, each
     # training interaction a target once. Smaller values overlap windows and
-    # oversample heavy users; 0 and values above maxlen are rejected. Training
+    # oversample heavy users; 0 and values above maxlen are rejected at
+    # construction (__post_init__). Training
     # only: inference always uses the most recent sasrec_maxlen items. See
     # sim/agents/sasrec_data.py for the anchoring rule.
     sasrec_window_stride: int | None = None
@@ -154,6 +155,16 @@ class SimConfig:
     sasrec_inject_rating: bool = True
     # Hidden width of the rating head MLP.
     sasrec_rating_head_hidden: int = 64
+
+    def __post_init__(self) -> None:
+        # Imported here, not at module level: sim.agents pulls in LensKit and
+        # the persona stack, which a config module should not depend on at
+        # import time.
+        from sim.agents.sasrec_data import resolve_window_stride
+
+        # Fail at construction rather than logging an unusable stride to
+        # MLflow and only raising once the SASRec data is built.
+        resolve_window_stride(self.sasrec_window_stride, self.sasrec_maxlen)
 
     def as_dict(self) -> dict:
         """Return a flat dict of all parameters (for MLflow logging)."""
