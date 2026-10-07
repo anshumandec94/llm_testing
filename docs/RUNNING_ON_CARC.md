@@ -45,7 +45,10 @@ uv run python experiments/run_sasrec_eval.py --sweep u2566
 # detach with Ctrl-b d; reattach with: tmux attach -t sasrec
 ```
 
-Rerunning resumes training from the last checkpoint.
+Training stops when validation MAE has not improved for `--patience` epochs (default 5); `--epochs` is only a ceiling.
+At about 95 s per epoch plus validation scoring, expect tens of minutes to a few hours rather than the 26 hours that a fixed 1000 epochs would take.
+Watch convergence in `runs/sasrec_u2566/validation.csv`; the held-out table scores `best.pt`, the best validation epoch.
+Rerunning resumes training from the last checkpoint, with its validation history.
 
 ## Bringing results back
 
