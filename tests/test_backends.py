@@ -154,6 +154,8 @@ class TestLLM:
 
     def test_wraps_the_real_agent_through_evaluate(self, env):
         """A real LLMAgent, with only model loading and generation mocked."""
+        # The agent is mlx-only until #15, and mlx_lm installs only on macOS.
+        pytest.importorskip("mlx_lm")
         from sim.agents.llm import LLMAgent
 
         with patch("mlx_lm.load", return_value=(object(), None)):

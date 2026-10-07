@@ -20,7 +20,8 @@ non-zero if any check fails. It runs nothing.
     mlflow        the tracking URI runs will write to, as an absolute path.
 
 Usage:
-    uv run python scripts/preflight.py --sweep u2566
+    uv run python scripts/preflight.py            # the u2566 sweep
+    uv run python scripts/preflight.py --sweep u128
 """
 
 from __future__ import annotations
@@ -134,7 +135,10 @@ def run_checks(cfg: SimConfig) -> list[Check]:
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Report whether this machine is ready for a comparison run.")
-    parser.add_argument("--sweep", choices=sorted(SWEEPS), required=True, help="The sweep the run will use.")
+    parser.add_argument(
+        "--sweep", choices=sorted(SWEEPS), default="u2566",
+        help="The sweep the run will use; embedding caches are keyed by it. Default u2566.",
+    )
     args = parser.parse_args(argv)
 
     checks = run_checks(sweep_config(args.sweep))
