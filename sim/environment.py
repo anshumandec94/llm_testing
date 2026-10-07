@@ -42,6 +42,28 @@ COLLECTION_USER_PREF = "user_pref_item_factors"
 _CHROMA_BATCH_SIZE = 5000  # safely below ChromaDB's hard limit of 5461
 
 
+def embedding_collection_names(config: SimConfig) -> tuple[str, str, str]:
+    """The (associative, semantic, user-pref) ChromaDB collections `config` reads.
+
+    Keyed by config content hashes, so a config whose collections are absent
+    rebuilds them on the first `Environment(config)`.
+    """
+    return (
+        f"{COLLECTION_ASSOC}__{config.platform_factor_cache_key()}",
+        f"{COLLECTION_SEMANTIC}__{config.semantic_cache_key()}",
+        f"{COLLECTION_USER_PREF}__{config.user_pref_cache_key()}",
+    )
+
+
+def embedding_factor_paths(config: SimConfig) -> tuple[Path, Path]:
+    """The (platform user factors, user-pref factors) `.npz` caches `config` reads."""
+    db_path = Path(config.embeddings_dir)
+    return (
+        db_path / f"user_factors__{config.platform_factor_cache_key()}.npz",
+        db_path / f"user_pref_factors__{config.user_pref_cache_key()}.npz",
+    )
+
+
 def _chroma_upsert_batched(
     col, ids: list, embeddings: list, *, desc: str = "Upserting embeddings"
 ) -> None:
@@ -90,21 +112,12 @@ class Environment:
         db_path = Path(config.embeddings_dir)
         db_path.mkdir(parents=True, exist_ok=True)
         self.chroma_client = chromadb.PersistentClient(path=str(db_path))
-        self._assoc_collection_name = (
-            f"{COLLECTION_ASSOC}__{self.config.platform_factor_cache_key()}"
-        )
-        self._semantic_collection_name = (
-            f"{COLLECTION_SEMANTIC}__{self.config.semantic_cache_key()}"
-        )
-        self._user_pref_collection_name = (
-            f"{COLLECTION_USER_PREF}__{self.config.user_pref_cache_key()}"
-        )
-        self._user_factor_path = (
-            db_path / f"user_factors__{self.config.platform_factor_cache_key()}.npz"
-        )
-        self._user_pref_factor_path = (
-            db_path / f"user_pref_factors__{self.config.user_pref_cache_key()}.npz"
-        )
+        (
+            self._assoc_collection_name,
+            self._semantic_collection_name,
+            self._user_pref_collection_name,
+        ) = embedding_collection_names(config)
+        self._user_factor_path, self._user_pref_factor_path = embedding_factor_paths(config)
 
         # ── Build / load embedding collections ────────────────────────────
         self._setup_associative_embeddings()
