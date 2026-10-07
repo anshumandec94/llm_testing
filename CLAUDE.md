@@ -91,7 +91,8 @@ Stale collections under old keys are not auto-deleted.
 
 ## MLflow & Artifacts
 
-- Metrics and params are logged to `mlflow.db` (local).
+- Metrics and params are logged to `SimConfig.mlflow_tracking_uri`: `MLFLOW_TRACKING_URI` if set, else `mlflow.db` at the repo root as an absolute path. Relative local URIs are refused.
+- Arms scored on different machines are combined with `scripts/merge_runs.py`, which refuses runs whose `scored_pairs.csv` differ.
 - `SimConfig.as_dict()` logs `agent_types` and `agent_type_proportions` as raw Python `str()` reprs - use `eval()` or re-parse when querying MLflow for these fields.
 - Per-round recommendation parquets land in `mlartifacts/`.
 

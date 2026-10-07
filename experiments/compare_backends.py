@@ -28,6 +28,11 @@ Metrics:
 nan predictions are excluded from every error metric, never imputed, so
 `meta/item_count` is `meta/pair_count - meta/nan_count`.
 
+Runs land in this machine's store (`SimConfig.mlflow_tracking_uri`: the
+`MLFLOW_TRACKING_URI` environment variable, else `mlflow.db` at the repo
+root). Arms from different machines are put into one table by
+`scripts/merge_runs.py`, which refuses arms that scored different pairs.
+
 Usage:
     uv run python experiments/compare_backends.py --backend bias_only
     uv run python experiments/compare_backends.py --backend associative --sweep u2566
@@ -63,7 +68,7 @@ from experiments.backends import (
 )
 from experiments.bias_only_null import ITEM_SELECTION, MAX_ITEMS, SWEEPS, clustered_mae
 from experiments.llm_vs_associative import BASE_CONFIG, MLFLOW_URI, _log_scored_pairs, select_held_items
-from sim.config import SimConfig
+from sim.config import SimConfig, check_tracking_uri
 from sim.environment import Environment
 from sim.population import build_user_assignments
 
@@ -203,7 +208,10 @@ def run_backend(
 
     A backend with a `describe()` (SASRec) also logs the params and the saved
     training config it returns, so the run names the model it scored.
+    `tracking_uri` must be absolute, so the store a run lands in does not
+    depend on the working directory.
     """
+    check_tracking_uri(tracking_uri)
     frame = score_backend(
         env, assignments, backend, max_items_per_user, item_selection,
         seed=cfg.random_seed, split=cfg.recommender_eval_split,
@@ -211,6 +219,7 @@ def run_backend(
     metrics = compute_metrics(frame)
     mlflow.set_tracking_uri(tracking_uri)
     mlflow.set_experiment(EXPERIMENT_NAME)
+    logger.info("logging %s to %s", run_name, tracking_uri)
     with mlflow.start_run(run_name=run_name) as run:
         mlflow.log_params({
             "backend": backend.name,
@@ -253,7 +262,10 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=f"Held-out items per user (default {MAX_ITEMS}). 0 means all.",
     )
     parser.add_argument("--item-selection", choices=["first", "random"], default=ITEM_SELECTION)
-    parser.add_argument("--mlflow-uri", default=MLFLOW_URI)
+    parser.add_argument(
+        "--mlflow-uri", default=MLFLOW_URI,
+        help="Absolute tracking URI. Default: MLFLOW_TRACKING_URI, else mlflow.db at the repo root.",
+    )
     parser.add_argument(
         "--checkpoint", type=Path, default=None,
         help="SASRec checkpoint from scripts/train_sasrec.py. Required for --backend sasrec.",
