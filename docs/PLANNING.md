@@ -154,7 +154,7 @@ All hyperparameters live in `SimConfig`:
 |-----------|---------|-------------|
 | `data_dir` | `data/ml-32m` | Path to ML-32M CSVs |
 | `embeddings_dir` | `embeddings/chroma` | ChromaDB persistence path |
-| `mlflow_tracking_uri` | `mlruns` | Local MLflow directory |
+| `mlflow_tracking_uri` | `MLFLOW_TRACKING_URI`, else `sqlite:///<repo>/mlflow.db` | MLflow store; must be absolute |
 | `experiment_name` | `abm-recsys` | MLflow experiment name |
 | `eval_user_frac` | `0.05` | Fraction of users in eval set |
 | `holdout_frac` | `0.2` | Fraction of each eval user's ratings held out |

@@ -9,6 +9,7 @@ different machines (the mlx LLM, a CUDA SASRec) still score the same pairs
 and can sit in one table. `scored_pairs.csv` is the evidence that they did.
 
 Per run, as MLflow artifacts:
+    split.json                     {"split_cache_key": ...}, the split fingerprint
     scored_pairs.csv               the exact (userId, movieId) pairs selected,
                                    including any the backend returned nan for
     per_item_predictions.parquet   one row per pair: userId, movieId, backend,
@@ -28,6 +29,11 @@ Metrics:
 nan predictions are excluded from every error metric, never imputed, so
 `meta/item_count` is `meta/pair_count - meta/nan_count`.
 
+Runs land in this machine's store (`SimConfig.mlflow_tracking_uri`: the
+`MLFLOW_TRACKING_URI` environment variable, else `mlflow.db` at the repo
+root). Arms from different machines are put into one table by
+`scripts/merge_runs.py`, which refuses arms that scored different pairs.
+
 Usage:
     uv run python experiments/compare_backends.py --backend bias_only
     uv run python experiments/compare_backends.py --backend associative --sweep u2566
@@ -46,6 +52,7 @@ import logging
 import sys
 import tempfile
 from pathlib import Path
+from urllib.parse import urlparse
 
 import mlflow
 import numpy as np
@@ -63,7 +70,7 @@ from experiments.backends import (
 )
 from experiments.bias_only_null import ITEM_SELECTION, MAX_ITEMS, SWEEPS, clustered_mae
 from experiments.llm_vs_associative import BASE_CONFIG, MLFLOW_URI, _log_scored_pairs, select_held_items
-from sim.config import SimConfig
+from sim.config import SimConfig, check_tracking_uri
 from sim.environment import Environment
 from sim.population import build_user_assignments
 
@@ -75,6 +82,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 EXPERIMENT_NAME = "backend-comparison"
+SPLIT_FILE = "split.json"
 # Backends the harness can construct. The rest of BACKEND_REGISTRY are stubs
 # that raise NotImplementedError from their constructor.
 BUILDABLE = ("bias_only", "associative", "llm", "sasrec")
@@ -188,6 +196,20 @@ def compute_metrics(frame: pd.DataFrame) -> dict[str, float]:
     }
 
 
+def set_experiment_beside_store(tracking_uri: str, name: str) -> None:
+    """`mlflow.set_experiment`, but a new experiment's artifacts sit beside its store.
+
+    MLflow otherwise puts a sqlite store's artifacts under `<cwd>/mlruns`, so
+    where they land would depend on the working directory even with an
+    absolute tracking URI. Existing experiments keep their location.
+    """
+    parsed = urlparse(tracking_uri)
+    if parsed.scheme == "sqlite" and mlflow.get_experiment_by_name(name) is None:
+        store_dir = Path(parsed.path[1:]).parent
+        mlflow.create_experiment(name, artifact_location=(store_dir / "mlartifacts").as_uri())
+    mlflow.set_experiment(name)
+
+
 def run_backend(
     cfg: SimConfig,
     env: Environment,
@@ -203,14 +225,18 @@ def run_backend(
 
     A backend with a `describe()` (SASRec) also logs the params and the saved
     training config it returns, so the run names the model it scored.
+    `tracking_uri` must be absolute, so the store a run lands in does not
+    depend on the working directory.
     """
+    check_tracking_uri(tracking_uri)
     frame = score_backend(
         env, assignments, backend, max_items_per_user, item_selection,
         seed=cfg.random_seed, split=cfg.recommender_eval_split,
     )
     metrics = compute_metrics(frame)
     mlflow.set_tracking_uri(tracking_uri)
-    mlflow.set_experiment(EXPERIMENT_NAME)
+    set_experiment_beside_store(tracking_uri, EXPERIMENT_NAME)
+    logger.info("logging %s to %s", run_name, tracking_uri)
     with mlflow.start_run(run_name=run_name) as run:
         mlflow.log_params({
             "backend": backend.name,
@@ -221,6 +247,9 @@ def run_backend(
             "eval_split": cfg.recommender_eval_split,
             "split_cache_key": cfg.split_cache_key(),
         })
+        # Also an artifact, so a run downloaded and copied off this machine
+        # still carries its split fingerprint (merge_runs.py --artifacts).
+        mlflow.log_dict({"split_cache_key": cfg.split_cache_key()}, SPLIT_FILE)
         mlflow.log_metrics(metrics)
         describe = getattr(backend, "describe", None)
         if callable(describe):
@@ -253,7 +282,10 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=f"Held-out items per user (default {MAX_ITEMS}). 0 means all.",
     )
     parser.add_argument("--item-selection", choices=["first", "random"], default=ITEM_SELECTION)
-    parser.add_argument("--mlflow-uri", default=MLFLOW_URI)
+    parser.add_argument(
+        "--mlflow-uri", default=MLFLOW_URI,
+        help="Absolute tracking URI. Default: MLFLOW_TRACKING_URI, else mlflow.db at the repo root.",
+    )
     parser.add_argument(
         "--checkpoint", type=Path, default=None,
         help="SASRec checkpoint from scripts/train_sasrec.py. Required for --backend sasrec.",

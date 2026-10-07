@@ -8,8 +8,46 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from dataclasses import dataclass, field, fields
 from pathlib import Path
+from urllib.parse import urlparse
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def default_tracking_uri() -> str:
+    """The MLflow store this machine writes to when a config names none.
+
+    `MLFLOW_TRACKING_URI` sets it per machine; otherwise it is `mlflow.db` at
+    the repo root, as an absolute path. A relative default would mean a
+    different database depending on the working directory, and runs from two
+    machines could never be found together.
+    """
+    return os.environ.get("MLFLOW_TRACKING_URI") or f"sqlite:///{REPO_ROOT / 'mlflow.db'}"
+
+
+def check_tracking_uri(uri: str) -> None:
+    """Raise if `uri` names a local store by a relative path.
+
+    Remote stores (http, databricks, ...) pass. `sqlite:///rel.db` and a bare
+    `mlruns` resolve against the working directory, which is how a run ends up
+    in a store nobody looks in.
+    """
+    parsed = urlparse(uri)
+    if parsed.scheme == "sqlite":
+        # sqlite:///abs/path parses to path "//abs/path"; sqlite:///rel to "/rel".
+        local = parsed.path[1:] if parsed.path.startswith("/") else parsed.path
+    elif parsed.scheme in ("", "file"):
+        local = parsed.path
+    else:
+        return
+    if not Path(local).is_absolute():
+        raise ValueError(
+            f"MLflow tracking URI {uri!r} is a relative path, so where runs land depends on the "
+            f"working directory. Use an absolute path, e.g. sqlite:///{REPO_ROOT / 'mlflow.db'}, "
+            "or set MLFLOW_TRACKING_URI."
+        )
 
 
 @dataclass
@@ -19,7 +57,8 @@ class SimConfig:
     embeddings_dir: Path = field(default_factory=lambda: Path("embeddings/chroma"))
 
     # ── MLflow ─────────────────────────────────────────────────────────────
-    mlflow_tracking_uri: str = "sqlite:///mlflow.db"
+    # Absolute, and per machine via MLFLOW_TRACKING_URI: see default_tracking_uri.
+    mlflow_tracking_uri: str = field(default_factory=default_tracking_uri)
     experiment_name: str = "abm-recsys"
 
     # ── Data split ─────────────────────────────────────────────────────────
@@ -168,6 +207,7 @@ class SimConfig:
         # Fail at construction rather than logging an unusable stride to
         # MLflow and only raising once the SASRec data is built.
         resolve_window_stride(self.sasrec_window_stride, self.sasrec_maxlen)
+        check_tracking_uri(self.mlflow_tracking_uri)
 
     def as_dict(self) -> dict:
         """Return a flat dict of all parameters (for MLflow logging)."""

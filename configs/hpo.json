@@ -2,7 +2,6 @@
   "base_config": {
     "data_dir": "data/ml-32m",
     "embeddings_dir": "embeddings/chroma",
-    "mlflow_tracking_uri": "sqlite:///mlflow.db",
     "experiment_name": "abm-recsys",
     "eval_user_frac": 0.1,
     "validation_frac": 0.1,

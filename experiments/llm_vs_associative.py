@@ -38,7 +38,7 @@ Usage:
     uv run python experiments/llm_vs_associative.py
 
 View results:
-    uv run mlflow ui --backend-store-uri sqlite:///mlflow.db
+    uv run mlflow ui --backend-store-uri sqlite:///$PWD/mlflow.db
     Navigate to the "llm-agent-comparison" experiment.
 
 Add or remove LLM variants by editing LLM_VARIANTS below.
@@ -74,14 +74,12 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 EXPERIMENT_NAME = "llm-agent-comparison"
-MLFLOW_URI = "sqlite:///mlflow.db"
 
 # ── Base config shared across all runs ───────────────────────────────────────
 # eval_user_frac controls who gets EVALUATED — the recommender bias model and
 # embeddings are always built from all eligible users' training data.
 BASE_CONFIG = SimConfig(
     experiment_name=EXPERIMENT_NAME,
-    mlflow_tracking_uri=MLFLOW_URI,
     experiment_profile="recommender_only",
     recommender_eval_split="held_out",
     eval_user_frac=0.001,
@@ -91,6 +89,8 @@ BASE_CONFIG = SimConfig(
     mf_regularization=0.1,
     mf_damping=5.0,
 )
+# This machine's store, absolute: SimConfig's default_tracking_uri.
+MLFLOW_URI = BASE_CONFIG.mlflow_tracking_uri
 
 # ── LLM variants to evaluate ─────────────────────────────────────────────────
 # Each dict becomes kwargs for LLMAgent and a label for the MLflow run.
