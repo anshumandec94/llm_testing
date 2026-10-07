@@ -19,7 +19,7 @@ Usage examples
     uv run python main.py --hpo_config configs/hpo.json
 
 # Launch the MLflow UI to inspect results:
-    mlflow ui --backend-store-uri mlruns
+    uv run mlflow ui --backend-store-uri sqlite:///$PWD/mlflow.db
 """
 from __future__ import annotations
 

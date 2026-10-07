@@ -8,6 +8,8 @@ fingerprint. Synthetic fixtures only; MLflow writes to a tmp dir.
 """
 from __future__ import annotations
 
+import dataclasses
+import os
 from pathlib import Path
 
 import mlflow
@@ -71,6 +73,47 @@ class TestSplitFingerprint:
             )
 
 
+def _download(uri: str, run_id: str, dst: Path) -> Path:
+    mlflow.MlflowClient(tracking_uri=uri).download_artifacts(run_id, "", str(dst))
+    return dst
+
+
+class TestArtifactsRoute:
+    """The cross-machine route must check the split as strictly as --run does."""
+
+    def test_artifacts_land_beside_the_store_not_the_working_directory(self, two_stores):
+        for uri, run_id in two_stores:
+            artifact_uri = mlflow.MlflowClient(tracking_uri=uri).get_run(run_id).info.artifact_uri
+            store_dir = Path(uri.removeprefix("sqlite:///")).parent
+            assert artifact_uri.startswith((store_dir / "mlartifacts").as_uri())
+            assert not artifact_uri.startswith(Path(os.getcwd()).as_uri() + "/mlruns")
+
+    def test_a_downloaded_run_carries_its_split_fingerprint(self, tiny_config, two_stores, tmp_path):
+        arm = load_from_artifacts(_download(two_stores[0][0], two_stores[0][1], tmp_path / "copied"))
+        assert arm.split_cache_key == tiny_config.split_cache_key()
+
+    def test_refuses_a_directory_without_a_split_fingerprint(self, two_stores, tmp_path):
+        copied = _download(two_stores[0][0], two_stores[0][1], tmp_path / "copied")
+        (copied / "split.json").unlink()
+        with pytest.raises(FileNotFoundError, match="split.json"):
+            load_from_artifacts(copied)
+
+    def test_refuses_a_different_training_split_that_scored_the_same_pairs(
+        self, tiny_config, env, assignments, two_stores, tmp_path
+    ):
+        """Held-out pairs do not depend on validation_frac, so only the fingerprint catches this."""
+        other_split = dataclasses.replace(tiny_config, validation_frac=tiny_config.validation_frac + 0.1)
+        assert other_split.split_cache_key() != tiny_config.split_cache_key()
+        uri_c, run_c = _harness_run(other_split, env, assignments, tmp_path / "machine3")
+        arms = [
+            load_from_artifacts(_download(two_stores[0][0], two_stores[0][1], tmp_path / "a")),
+            load_from_artifacts(_download(uri_c, run_c, tmp_path / "c")),
+        ]
+        assert arms[0].scored_pairs.equals(arms[1].scored_pairs)
+        with pytest.raises(RunMismatchError, match="different splits"):
+            merge_runs(arms)
+
+
 class TestMerge:
 
     def test_two_stores_merge_into_one_table(self, two_stores):
@@ -92,7 +135,7 @@ class TestMerge:
         """The cross-machine route: one run downloaded and copied, one local."""
         (uri_a, run_a), (uri_b, run_b) = two_stores
         copied = tmp_path / "copied-from-server"
-        mlflow.MlflowClient(tracking_uri=uri_b).download_artifacts(run_b, "", str(copied))
+        _download(uri_b, run_b, copied)
         summary, _ = merge_runs([load_from_mlflow(uri_a, run_a), load_from_artifacts(copied)])
         assert summary["source"].tolist() == [run_a[:8], "copied-from-server"]
 
@@ -129,6 +172,19 @@ class TestMerge:
         arms[1].predictions.loc[0, "actual_rating"] += 1.0
         with pytest.raises(RunMismatchError, match="actual ratings"):
             merge_runs(arms)
+
+    def test_common_metrics_use_only_pairs_every_arm_scored(self, two_stores):
+        arms = [load_from_mlflow(uri, run_id) for uri, run_id in two_stores]
+        predictions = arms[1].predictions
+        worst = (predictions["predicted_rating"] - predictions["actual_rating"]).abs().nlargest(3).index
+        predictions.loc[worst, "predicted_rating"] = np.nan
+        summary, _ = merge_runs(arms)
+
+        # Dropping its worst pairs flatters the arm on its own metrics ...
+        assert summary.loc[1, "error/mae"] < summary.loc[0, "error/mae"]
+        # ... but on the common pairs the two identical arms tie.
+        assert summary.loc[0, "common/mae"] == pytest.approx(summary.loc[1, "common/mae"])
+        assert (summary["common/pair_count"] == len(predictions) - 3).all()
 
     def test_cli_exits_non_zero_on_mismatch_and_writes_on_success(
         self, tiny_config, env, assignments, two_stores, tmp_path

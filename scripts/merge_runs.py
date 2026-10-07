@@ -9,8 +9,9 @@ arms side by side without re-running anything.
 
 It refuses, rather than warns, unless every arm scored exactly the same
 (userId, movieId) pairs against the same actual ratings. Equal
-`meta/item_count` is not equal pairs. Runs from MLflow must also carry the
-same `split_cache_key` param.
+`meta/item_count` is not equal pairs. Every run must also carry the same
+split fingerprint (`split_cache_key`): pairs and ratings come from the
+held-out set, so arms trained on different splits can still match on both.
 
 A run is given either by its store and id (`--run URI RUN_ID`), for a store
 this machine can read, or by a directory holding its downloaded artifacts
@@ -27,8 +28,11 @@ Usage:
         --out reports/backend_comparison
 
 Writes, with `--out`:
-    summary.csv           one row per arm: label, backend, source, and the
-                          harness metrics recomputed from the predictions
+    summary.csv           one row per arm: label, backend, source, the
+                          harness metrics recomputed from the predictions,
+                          and `common/` metrics over only the pairs every arm
+                          scored, the like-for-like ranking when arms differ
+                          in which pairs they returned nan for
     per_pair.parquet      one row per pair: userId, movieId, actual_rating,
                           and one predicted_rating column per arm
 """
@@ -36,6 +40,7 @@ Writes, with `--out`:
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import tempfile
 from dataclasses import dataclass
@@ -46,7 +51,7 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from experiments.compare_backends import compute_metrics  # noqa: E402
+from experiments.compare_backends import SPLIT_FILE, compute_metrics  # noqa: E402
 from sim.config import check_tracking_uri  # noqa: E402
 
 PREDICTIONS_FILE = "per_item_predictions.parquet"
@@ -67,14 +72,26 @@ class ArmRun:
     source: str
     predictions: pd.DataFrame
     scored_pairs: pd.DataFrame
-    # None for an artifacts directory, which carries no params.
-    split_cache_key: str | None
+    split_cache_key: str
 
 
 def load_from_artifacts(directory: Path, split_cache_key: str | None = None, source: str | None = None) -> ArmRun:
-    """Read one run from a directory of its downloaded artifacts."""
+    """Read one run from a directory of its downloaded artifacts.
+
+    The split fingerprint comes from `split.json` unless `split_cache_key` is
+    given (from the run's params). Without either the run is refused: it
+    could have been scored on any split.
+    """
     predictions_path = directory / PREDICTIONS_FILE
     pairs_path = directory / PAIRS_FILE
+    split_path = directory / SPLIT_FILE
+    if split_cache_key is None:
+        if not split_path.is_file():
+            raise FileNotFoundError(
+                f"{split_path} is missing, so the split this run was scored on is unknown. "
+                "Runs from before split.json was logged can be merged with --run instead."
+            )
+        split_cache_key = str(json.loads(split_path.read_text())["split_cache_key"])
     for path in (predictions_path, pairs_path):
         if not path.is_file():
             raise FileNotFoundError(f"{path} is missing; is {directory} a compare_backends run's artifacts?")
@@ -115,8 +132,8 @@ def verify_comparable(arms: list[ArmRun]) -> None:
     """Raise `RunMismatchError` unless every arm scored the same pairs on the same split.
 
     Checks, in order: labels are distinct; each run's predictions cover
-    exactly its own `scored_pairs.csv`; every run that records a split
-    fingerprint records the same one; every arm's `scored_pairs.csv` holds the
+    exactly its own `scored_pairs.csv`; every run records the same split
+    fingerprint; every arm's `scored_pairs.csv` holds the
     same pairs; and every arm saw the same actual rating for each pair.
     """
     if len(arms) < 2:
@@ -129,7 +146,7 @@ def verify_comparable(arms: list[ArmRun]) -> None:
         if not _sorted_pairs(arm.predictions).equals(_sorted_pairs(arm.scored_pairs)):
             raise RunMismatchError(f"{arm.label}: {PREDICTIONS_FILE} does not cover exactly its own {PAIRS_FILE}")
 
-    keys = {arm.label: arm.split_cache_key for arm in arms if arm.split_cache_key is not None}
+    keys = {arm.label: arm.split_cache_key for arm in arms}
     if len(set(keys.values())) > 1:
         raise RunMismatchError(f"runs were scored on different splits (split_cache_key): {keys}")
 
@@ -162,14 +179,28 @@ def merge_runs(arms: list[ArmRun]) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Verify the arms are comparable, then return (summary, per_pair).
 
     `summary` has one row per arm, metrics recomputed from its predictions by
-    the harness's own `compute_metrics`. `per_pair` has one row per pair and a
+    the harness's own `compute_metrics`. Each arm's own metrics skip its own
+    nan pairs, so arms that returned nan on different pairs are measured on
+    different pairs; the `common/` columns repeat the metrics on only the
+    pairs every arm scored. `per_pair` has one row per pair and a
     `predicted_rating[<label>]` column per arm.
     """
     verify_comparable(arms)
-    summary = pd.DataFrame([
-        {"label": arm.label, "backend": arm.backend, "source": arm.source, **compute_metrics(arm.predictions)}
-        for arm in arms
-    ])
+    scored_by_all = None
+    for arm in arms:
+        scored = pd.MultiIndex.from_frame(arm.predictions.loc[arm.predictions["predicted_rating"].notna(), PAIR_COLUMNS])
+        scored_by_all = scored if scored_by_all is None else scored_by_all.intersection(scored)
+    rows = []
+    for arm in arms:
+        in_common = pd.MultiIndex.from_frame(arm.predictions[PAIR_COLUMNS]).isin(scored_by_all)
+        common = compute_metrics(arm.predictions[in_common]) if in_common.any() else {}
+        rows.append({
+            "label": arm.label, "backend": arm.backend, "source": arm.source,
+            **compute_metrics(arm.predictions),
+            **{f"common/{key.split('/', 1)[1]}": value for key, value in common.items() if key.startswith("error/")},
+            "common/pair_count": float(in_common.sum()),
+        })
+    summary = pd.DataFrame(rows)
     per_pair = arms[0].predictions[PAIR_COLUMNS + ["actual_rating"]]
     for arm in arms:
         column = arm.predictions[PAIR_COLUMNS + ["predicted_rating"]].rename(
